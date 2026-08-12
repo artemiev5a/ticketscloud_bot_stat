@@ -14,6 +14,7 @@ type TicketscloudOrdersResponse = {
 };
 
 const TICKETSCLOUD_ORDERS_URL = `${(process.env.TICKETSCLOUD_API_BASE_URL || 'https://api.ticketscloud.org').replace(/\/$/, '')}/v2/resources/orders`;
+const PAGE_SIZE = 200;
 
 function startOfUtcDay(date = new Date()): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
