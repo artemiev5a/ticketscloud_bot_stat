@@ -125,6 +125,20 @@ class TelegramBotEngine {
     this.config.isPollingActive = true;
 
     try {
+      const webhookResponse = await fetch(
+  `https://api.telegram.org/bot${this.config.token.trim()}/deleteWebhook`,
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ drop_pending_updates: false })
+  }
+);
+
+const webhookResult = await webhookResponse.json() as any;
+
+if (!webhookResult.ok) {
+  throw new Error(webhookResult.description || 'Не удалось отключить старый Telegram webhook');
+}
       this.botInfo = await telegramApi.getMe(this.config.token);
       this.addLog('system', 'Telegram Token Connected', `@${this.botInfo.username} (${this.botInfo.first_name})`);
       this.syncCommandsToTelegram().catch(() => {});
