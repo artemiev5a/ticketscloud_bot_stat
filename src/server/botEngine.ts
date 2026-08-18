@@ -1,6 +1,7 @@
 import { ActivityLog, BotCommand, BotConfig, BotInfo, ChatSession, TelegramUpdate } from '../types/telegram.js';
 import { telegramApi } from './telegramApi.js';
 import { ticketscloudService } from './ticketscloudService.js';
+import { encryptApiKey, decryptApiKey } from './cryptoUtils.js'; // 👈 Добавили импорт шифрования
 
 class TelegramBotEngine {
   private config: BotConfig = {
@@ -126,19 +127,19 @@ class TelegramBotEngine {
 
     try {
       const webhookResponse = await fetch(
-  `https://api.telegram.org/bot${this.config.token.trim()}/deleteWebhook`,
-  {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ drop_pending_updates: false })
-  }
-);
+        `https://api.telegram.org/bot${this.config.token.trim()}/deleteWebhook`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ drop_pending_updates: false })
+        }
+      );
 
-const webhookResult = await webhookResponse.json() as any;
+      const webhookResult = await webhookResponse.json() as any;
 
-if (!webhookResult.ok) {
-  throw new Error(webhookResult.description || 'Не удалось отключить старый Telegram webhook');
-}
+      if (!webhookResult.ok) {
+        throw new Error(webhookResult.description || 'Не удалось отключить старый Telegram webhook');
+      }
       this.botInfo = await telegramApi.getMe(this.config.token);
       this.addLog('system', 'Telegram Token Connected', `@${this.botInfo.username} (${this.botInfo.first_name})`);
       this.syncCommandsToTelegram().catch(() => {});
@@ -202,15 +203,15 @@ if (!webhookResult.ok) {
     this.recordUserMessage(chatId, user, text, 'user');
     this.addLog('incoming_msg', `Message from ${username}`, text, chatId, username, rawUpdate);
 
-    // 1. Awaiting key input
+    // 1. Ожидание ввода ключа (шифруем перед сохранением)
     if (this.awaitingKeyUsers.has(user.id) && !text.startsWith('/')) {
-      this.userApiKeys.set(user.id, text);
+      this.userApiKeys.set(user.id, encryptApiKey(text)); // 👈 ШИФРУЕМ
       this.awaitingKeyUsers.delete(user.id);
-      this.addLog('system', 'User set new TicketsCloud API Key', undefined, chatId, username);
+      this.addLog('system', 'User set new TicketsCloud API Key (Encrypted)', undefined, chatId, username);
 
       await this.sendBotReply(
         chatId,
-        '✅ <b>API-ключ успешно сохранен!</b>\n\nНажмите кнопку ниже, чтобы загрузить статистику:',
+        '✅ <b>API-ключ успешно и безопасно сохранен!</b>\n\nНажмите кнопку ниже, чтобы загрузить статистику:',
         [
           [{ text: '📊 Посмотреть статистику', callback_data: 'btn_stats' }]
         ]
@@ -218,18 +219,18 @@ if (!webhookResult.ok) {
       return;
     }
 
-    // 2. /setkey command
+    // 2. Команда /setkey (шифруем перед сохранением)
     if (text.startsWith('/setkey')) {
       const key = text.replace('/setkey', '').trim();
       if (!key) {
         await this.sendBotReply(chatId, '✏️ Отправьте команду с ключом в формате:\n\n<code>/setkey ВАШ_API_КЛЮЧ</code>');
         return;
       }
-      this.userApiKeys.set(user.id, key);
+      this.userApiKeys.set(user.id, encryptApiKey(key)); // 👈 ШИФРУЕМ
       this.awaitingKeyUsers.delete(user.id);
       await this.sendBotReply(
         chatId,
-        '✅ <b>API-ключ успешно сохранен!</b>',
+        '✅ <b>API-ключ успешно и безопасно сохранен!</b>',
         [
           [{ text: '📊 Посмотреть статистику', callback_data: 'btn_stats' }]
         ]
@@ -313,10 +314,12 @@ if (!webhookResult.ok) {
   }
 
   public async sendTicketscloudStats(chatId: number, userId: number = chatId) {
-    // Keys are scoped to the Telegram user, not to the bot-wide configuration.
-    // This prevents one organiser from accidentally receiving another's figures.
-    const apiKey = this.userApiKeys.get(userId) || '';
-    const res = await ticketscloudService.getStats(apiKey);
+    const encryptedKey = this.userApiKeys.get(userId) || '';
+    
+    // 👈 РАСШИФРОВЫВАЕМ ключ перед отправкой запроса к TicketsCloud
+    const realApiKey = decryptApiKey(encryptedKey); 
+    
+    const res = await ticketscloudService.getStats(realApiKey);
 
     const inlineKeyboard = res.reply_markup?.inline_keyboard;
     await this.sendBotReply(chatId, res.text, inlineKeyboard);
@@ -387,7 +390,7 @@ if (!webhookResult.ok) {
     const now = Date.now();
 
     for (const [chatId, session] of this.chatSessions.entries()) {
-      const lastActivity = session._lastActivityTimestamp || 0;
+      const lastActivity = (session as any)._lastActivityTimestamp || 0;
       if (now - lastActivity > ONE_DAY_MS) {
         this.chatSessions.delete(chatId);
       }
