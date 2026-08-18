@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { botEngine } from './botEngine.js';
+import { encryptApiKey } from './cryptoUtils.js';
 
 export const apiRouter = Router();
 
@@ -13,10 +14,17 @@ apiRouter.get('/bot/status', async (req, res) => {
   }
 });
 
-// 2. Обновить конфиг (включить/выключить бота, сменить токен)
+// 2. Обновить конфиг (включить/выключить бота, сменить токен, зашифровать ключ)
 apiRouter.post('/bot/config', (req, res) => {
   try {
-    botEngine.updateConfig(req.body);
+    const configData = { ...req.body };
+
+    // Безопасность: автоматически шифруем API-ключ TicketsCloud перед передачей в engine
+    if (configData.ticketscloudApiKey) {
+      configData.ticketscloudApiKey = encryptApiKey(configData.ticketscloudApiKey);
+    }
+
+    botEngine.updateConfig(configData);
     res.json({ ok: true, message: 'Config updated' });
   } catch (err: any) {
     res.status(500).json({ ok: false, error: err.message });
@@ -151,3 +159,6 @@ apiRouter.post('/bot/simulate-update', async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+// Поддержка импортов как `import { apiRouter }`, так и `import routes`
+export default apiRouter;
