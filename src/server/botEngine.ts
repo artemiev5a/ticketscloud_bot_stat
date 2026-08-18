@@ -1,7 +1,7 @@
 import { ActivityLog, BotCommand, BotConfig, BotInfo, ChatSession, TelegramUpdate } from '../types/telegram.js';
 import { telegramApi } from './telegramApi.js';
 import { ticketscloudService } from './ticketscloudService.js';
-import { encryptApiKey, decryptApiKey } from './cryptoUtils.js'; // 👈 Добавили импорт шифрования
+import { encryptApiKey, decryptApiKey } from './cryptoUtils.js';
 
 class TelegramBotEngine {
   private config: BotConfig = {
@@ -203,9 +203,9 @@ class TelegramBotEngine {
     this.recordUserMessage(chatId, user, text, 'user');
     this.addLog('incoming_msg', `Message from ${username}`, text, chatId, username, rawUpdate);
 
-    // 1. Ожидание ввода ключа (шифруем перед сохранением)
+    // 1. Ожидание ввода ключа
     if (this.awaitingKeyUsers.has(user.id) && !text.startsWith('/')) {
-      this.userApiKeys.set(user.id, encryptApiKey(text)); // 👈 ШИФРУЕМ
+      this.userApiKeys.set(user.id, encryptApiKey(text)); 
       this.awaitingKeyUsers.delete(user.id);
       this.addLog('system', 'User set new TicketsCloud API Key (Encrypted)', undefined, chatId, username);
 
@@ -219,14 +219,14 @@ class TelegramBotEngine {
       return;
     }
 
-    // 2. Команда /setkey (шифруем перед сохранением)
+    // 2. Команда /setkey
     if (text.startsWith('/setkey')) {
       const key = text.replace('/setkey', '').trim();
       if (!key) {
         await this.sendBotReply(chatId, '✏️ Отправьте команду с ключом в формате:\n\n<code>/setkey ВАШ_API_КЛЮЧ</code>');
         return;
       }
-      this.userApiKeys.set(user.id, encryptApiKey(key)); // 👈 ШИФРУЕМ
+      this.userApiKeys.set(user.id, encryptApiKey(key));
       this.awaitingKeyUsers.delete(user.id);
       await this.sendBotReply(
         chatId,
@@ -238,7 +238,7 @@ class TelegramBotEngine {
       return;
     }
 
-    // 3. Command processing
+    // 3. Обработка команд
     if (text.startsWith('/')) {
       const parts = text.split(' ');
       const rawCmd = parts[0].substring(1).replace(/@.*/, '').toLowerCase();
@@ -267,7 +267,7 @@ class TelegramBotEngine {
       return;
     }
 
-    // Default response for simple text
+    // Ответ по умолчанию
     const startCmd = this.commands.get('start');
     await this.sendBotReply(
       chatId,
@@ -316,9 +316,15 @@ class TelegramBotEngine {
   public async sendTicketscloudStats(chatId: number, userId: number = chatId) {
     const encryptedKey = this.userApiKeys.get(userId) || '';
     
-    // 👈 РАСШИФРОВЫВАЕМ ключ перед отправкой запроса к TicketsCloud
+    // 👇 ОТПРАВЛЯЕМ СТАТУС "ПЕЧАТАЕТ..."
+    try {
+      if (this.config.token) {
+        await telegramApi.sendChatAction(this.config.token, chatId, 'typing');
+      }
+    } catch (e) { /* игнорируем ошибки статуса */ }
+
+    // Расшифровываем ключ и запрашиваем статистику
     const realApiKey = decryptApiKey(encryptedKey); 
-    
     const res = await ticketscloudService.getStats(realApiKey);
 
     const inlineKeyboard = res.reply_markup?.inline_keyboard;
