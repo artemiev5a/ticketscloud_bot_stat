@@ -1,110 +1,69 @@
-import { BotInfo, TelegramInlineKeyboardMarkup, TelegramUpdate } from '../types/telegram.js';
-
-export class TelegramApiService {
-  private baseUrl(token: string): string {
-    const cleanToken = token.trim();
-    return `https://api.telegram.org/bot${cleanToken}`;
-  }
-
-  async getMe(token: string): Promise<BotInfo> {
-    const url = `${this.baseUrl(token)}/getMe`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    const data = await res.json() as any;
-    if (!data.ok) {
-      throw new Error(data.description || 'Failed to fetch bot info from Telegram API');
-    }
-    return data.result as BotInfo;
-  }
-
-  async getUpdates(token: string, offset: number = 0, timeoutSec: number = 5): Promise<TelegramUpdate[]> {
-    const url = `${this.baseUrl(token)}/getUpdates?offset=${offset}&timeout=${timeoutSec}&allowed_updates=["message","callback_query"]`;
-    const res = await fetch(url, { signal: AbortSignal.timeout((timeoutSec + 5) * 1000) });
-    const data = await res.json() as any;
-    if (!data.ok) {
-      throw new Error(data.description || 'Failed to fetch updates from Telegram API');
-    }
-    return (data.result || []) as TelegramUpdate[];
-  }
-
-  async sendMessage(
-    token: string,
-    chatId: number | string,
-    text: string,
-    options?: {
-      parseMode?: 'HTML' | 'Markdown' | 'MarkdownV2';
-      replyMarkup?: TelegramInlineKeyboardMarkup;
-      disableWebPagePreview?: boolean;
-    }
-  ): Promise<any> {
-    const url = `${this.baseUrl(token)}/sendMessage`;
-    const body: any = {
-      chat_id: chatId,
-      text: text,
-      parse_mode: options?.parseMode || 'HTML',
-      disable_web_page_preview: options?.disableWebPagePreview ?? true
-    };
-
-    if (options?.replyMarkup) {
-      body.reply_markup = options.replyMarkup;
-    }
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(10000)
-    });
-
-    const data = await res.json() as any;
-    if (!data.ok) {
-      // Спасательный круг: Если HTML-разметка сломалась, Telegram вернет ошибку. Отправляем без разметки как fallback.
-      if (options?.parseMode && data.description?.includes('can\'t parse entities')) {
-        console.warn(`[Telegram API] Ошибка парсинга HTML, отправляю обычным текстом для чата ${chatId}`);
-        return this.sendMessage(token, chatId, text, { ...options, parseMode: undefined });
-      }
-      throw new Error(data.description || 'Failed to send message via Telegram API');
-    }
+export const telegramApi = {
+  async getMe(token: string) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
     return data.result;
-  }
+  },
 
-  async setMyCommands(token: string, commands: Array<{ command: string; description: string }>): Promise<boolean> {
-    const url = `${this.baseUrl(token)}/setMyCommands`;
-    // Очищаем команды (Telegram требует нижний регистр, без слэшей, 1-32 символа)
-    const formattedCommands = commands
-      .map(c => ({
-        command: c.command.replace(/^\//, '').toLowerCase().trim(),
-        description: c.description.slice(0, 256) || 'Bot Command'
-      }))
-      .filter(c => c.command.length >= 1 && c.command.length <= 32);
+  async getUpdates(token: string, offset: number, timeout: number = 3) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
+    return data.result;
+  },
 
-    const res = await fetch(url, {
+  async sendMessage(token: string, chatId: number, text: string, options: any = {}) {
+    const payload = {
+      chat_id: chatId,
+      text,
+      parse_mode: options.parseMode,
+      reply_markup: options.replyMarkup
+    };
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commands: formattedCommands }),
-      signal: AbortSignal.timeout(10000)
+      body: JSON.stringify(payload)
     });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
+    return data.result;
+  },
 
-    const data = await res.json() as any;
-    if (!data.ok) {
-      throw new Error(data.description || 'Failed to sync commands to Telegram');
+  async answerCallbackQuery(token: string, callbackQueryId: string, text?: string) {
+    const payload: any = { callback_query_id: callbackQueryId };
+    if (text) payload.text = text;
+    const res = await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
+    return data.result;
+  },
+
+  async setMyCommands(token: string, commands: any[]) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commands })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
+    return data.result;
+  },
+
+  // 👇 НАШ НОВЫЙ МЕТОД ДЛЯ СТАТУСА "ПЕЧАТАЕТ..."
+  async sendChatAction(token: string, chatId: number, action: string = 'typing') {
+    try {
+      await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, action })
+      });
+    } catch (e) {
+      console.error('Ошибка отправки chat action:', e);
     }
-    return true;
   }
-
-  async answerCallbackQuery(token: string, callbackQueryId: string, text?: string): Promise<boolean> {
-    const url = `${this.baseUrl(token)}/answerCallbackQuery`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        callback_query_id: callbackQueryId,
-        text: text || ''
-      }),
-      signal: AbortSignal.timeout(5000)
-    });
-    const data = await res.json() as any;
-    return data.ok === true;
-  }
-}
-
-export const telegramApi = new TelegramApiService();
+};
