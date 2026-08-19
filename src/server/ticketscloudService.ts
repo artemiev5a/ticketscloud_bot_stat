@@ -71,13 +71,11 @@ const cache = new Map<string, { data: { text: string; reply_markup?: any }; expi
 const CACHE_TTL_MS = 30 * 1000;
 
 export const ticketscloudService = {
-  // 👇 Обрати внимание, сюда добавлен параметр commissionRate
   async getStats(apiKey?: string, period: StatsPeriod = 'today', commissionRate: number = 0): Promise<{ text: string; reply_markup?: any }> {
     if (!apiKey?.trim()) {
       return { text: '⚠️ <b>API-ключ не указан!</b>', reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] } };
     }
 
-    // Добавляем комиссию в ключ кэша, чтобы при смене комиссии кэш сбрасывался
     const cacheKey = `${apiKey.trim()}_${period}_${commissionRate}`;
     const now = Date.now();
     const cachedItem = cache.get(cacheKey);
@@ -97,7 +95,7 @@ export const ticketscloudService = {
     try {
       while (hasMorePages && orders.length < MAX_ORDERS_LIMIT) {
         const query = new URLSearchParams({
-          status: 'done,partially_refunded', 
+          status: 'done', // 👈 Вот здесь строгий статус, из-за которого была ошибка
           created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
           page: String(page),
           page_size: String(PAGE_SIZE)
@@ -166,11 +164,9 @@ export const ticketscloudService = {
       }
     }
 
-    // 👇 МАТЕМАТИКА КОМИССИИ 👇
     const commissionSum = grossSales * (commissionRate / 100);
     const netSales = grossSales - commissionSum;
 
-    // Формируем блок текста о деньгах
     let moneyText = `💳 Оборот (Грязными): <b>${rub(grossSales)} ₽</b>\n`;
     if (commissionRate > 0) {
       moneyText += `📉 Комиссия (${commissionRate}%): <b>- ${rub(commissionSum)} ₽</b>\n`;
