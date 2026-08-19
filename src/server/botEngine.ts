@@ -1,6 +1,6 @@
 import { ActivityLog, BotCommand, BotConfig, BotInfo, ChatSession, TelegramUpdate } from '../types/telegram.js';
 import { telegramApi } from './telegramApi.js';
-import { ticketscloudService } from './ticketscloudService.js';
+import { ticketscloudService, StatsPeriod } from './ticketscloudService.js'; // 👈 Добавили StatsPeriod
 import { encryptApiKey, decryptApiKey } from './cryptoUtils.js';
 
 class TelegramBotEngine {
@@ -27,10 +27,7 @@ class TelegramBotEngine {
     this.initializeDefaultCommands();
     this.addLog('system', 'Telegram Bot Engine initialized', 'Ready to start');
     
-    // Auto start polling on server boot
     this.startEngine();
-
-    // Cleanup stale sessions once an hour
     setInterval(() => this.cleanupStaleSessions(), 1000 * 60 * 60);
   }
 
@@ -44,7 +41,7 @@ class TelegramBotEngine {
         responseText: '👋 <b>Добро пожаловать в TicketsCloud Statistics!</b>\n\nЯ помогу отслеживать продажи билетов и финансовую статистику в реальном времени.\n\nИспользуйте кнопки меню ниже или введите <code>/stats</code> для получения актуальной сводки.',
         buttons: [
           [
-            { text: '📊 Статистика продаж', callback_data: 'btn_stats' }
+            { text: '📊 Статистика продаж', callback_data: 'stats_today' } // 👈 Обновили callback
           ],
           [
             { text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' },
@@ -61,7 +58,7 @@ class TelegramBotEngine {
         responseText: '📊 Загрузка статистики TicketsCloud...',
         buttons: [
           [
-            { text: '🔄 Обновить данные', callback_data: 'btn_stats' }
+            { text: '🔄 Обновить данные', callback_data: 'stats_today' } // 👈 Обновили callback
           ]
         ],
         enabled: true
@@ -203,7 +200,6 @@ class TelegramBotEngine {
     this.recordUserMessage(chatId, user, text, 'user');
     this.addLog('incoming_msg', `Message from ${username}`, text, chatId, username, rawUpdate);
 
-    // 1. Ожидание ввода ключа
     if (this.awaitingKeyUsers.has(user.id) && !text.startsWith('/')) {
       this.userApiKeys.set(user.id, encryptApiKey(text)); 
       this.awaitingKeyUsers.delete(user.id);
@@ -213,13 +209,12 @@ class TelegramBotEngine {
         chatId,
         '✅ <b>API-ключ успешно и безопасно сохранен!</b>\n\nНажмите кнопку ниже, чтобы загрузить статистику:',
         [
-          [{ text: '📊 Посмотреть статистику', callback_data: 'btn_stats' }]
+          [{ text: '📊 Посмотреть статистику', callback_data: 'stats_today' }]
         ]
       );
       return;
     }
 
-    // 2. Команда /setkey
     if (text.startsWith('/setkey')) {
       const key = text.replace('/setkey', '').trim();
       if (!key) {
@@ -232,19 +227,18 @@ class TelegramBotEngine {
         chatId,
         '✅ <b>API-ключ успешно и безопасно сохранен!</b>',
         [
-          [{ text: '📊 Посмотреть статистику', callback_data: 'btn_stats' }]
+          [{ text: '📊 Посмотреть статистику', callback_data: 'stats_today' }]
         ]
       );
       return;
     }
 
-    // 3. Обработка команд
     if (text.startsWith('/')) {
       const parts = text.split(' ');
       const rawCmd = parts[0].substring(1).replace(/@.*/, '').toLowerCase();
 
       if (rawCmd === 'stats') {
-        await this.sendTicketscloudStats(chatId, user.id);
+        await this.sendTicketscloudStats(chatId, user.id, 'today');
         return;
       }
 
@@ -253,7 +247,7 @@ class TelegramBotEngine {
         this.addLog('command_exec', `Executed command /${rawCmd}`, undefined, chatId, username);
         
         if (matchedCmd.responseType === 'ticketscloud_stats' || matchedCmd.responseType === 'stats') {
-          await this.sendTicketscloudStats(chatId, user.id);
+          await this.sendTicketscloudStats(chatId, user.id, 'today');
         } else {
           await this.sendBotReply(chatId, matchedCmd.responseText || 'Команда выполнена', matchedCmd.buttons);
         }
@@ -267,7 +261,6 @@ class TelegramBotEngine {
       return;
     }
 
-    // Ответ по умолчанию
     const startCmd = this.commands.get('start');
     await this.sendBotReply(
       chatId,
@@ -290,8 +283,14 @@ class TelegramBotEngine {
       }
     } catch (e) { /* ignore */ }
 
-    if (data === 'btn_stats' || data === 'refresh_stats') {
-      await this.sendTicketscloudStats(chatId, user.id);
+    // 👇 ТУТ ИСПРАВЛЕНА ОБРАБОТКА ПЕРИОДОВ 
+    if (data === 'stats_today' || data === 'btn_stats' || data === 'refresh_stats') {
+      await this.sendTicketscloudStats(chatId, user.id, 'today');
+      return;
+    }
+
+    if (data === 'stats_week') {
+      await this.sendTicketscloudStats(chatId, user.id, 'week');
       return;
     }
 
@@ -313,19 +312,20 @@ class TelegramBotEngine {
     }
   }
 
-  public async sendTicketscloudStats(chatId: number, userId: number = chatId) {
+  // 👇 ДОБАВИЛИ ПЕРИОД В АРГУМЕНТЫ
+  public async sendTicketscloudStats(chatId: number, userId: number = chatId, period: StatsPeriod = 'today') {
     const encryptedKey = this.userApiKeys.get(userId) || '';
     
-    // 👇 ОТПРАВЛЯЕМ СТАТУС "ПЕЧАТАЕТ..."
     try {
       if (this.config.token) {
         await telegramApi.sendChatAction(this.config.token, chatId, 'typing');
       }
-    } catch (e) { /* игнорируем ошибки статуса */ }
+    } catch (e) { /* ignore */ }
 
-    // Расшифровываем ключ и запрашиваем статистику
     const realApiKey = decryptApiKey(encryptedKey); 
-    const res = await ticketscloudService.getStats(realApiKey);
+    
+    // 👇 ПЕРЕДАЕМ ПЕРИОД В СЕРВИС
+    const res = await ticketscloudService.getStats(realApiKey, period);
 
     const inlineKeyboard = res.reply_markup?.inline_keyboard;
     await this.sendBotReply(chatId, res.text, inlineKeyboard);
