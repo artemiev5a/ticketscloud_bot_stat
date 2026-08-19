@@ -2,19 +2,21 @@ export type StatsPeriod = 'today' | 'week';
 
 type Money = string | number;
 
+type Ticket = {
+  status?: string;
+  price?: Money;
+  full?: Money;
+  nominal?: Money;
+  [key: string]: any;
+};
+
 type Order = {
-  status?: string; // Добавили поле статуса для проверки
+  status?: string;
   event?: string;
   created_at?: string;
-  done_at?: string; // Дата фактической оплаты
-  tickets?: Array<any>;
-  values?: {
-    full?: Money;
-    price?: Money;
-    nominal?: Money;
-    extra?: Money;
-    discount?: Money;
-  };
+  done_at?: string;
+  tickets?: Ticket[];
+  values?: { full?: Money; price?: Money; nominal?: Money; extra?: Money; discount?: Money; };
 };
 
 type OrdersResponse = {
@@ -26,7 +28,7 @@ type OrdersResponse = {
 
 const API_URL = `${(process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '')}/v2/resources/orders`;
 const PAGE_SIZE = 200;
-const MAX_ORDERS_LIMIT = 20000; // Тот самый лимит на 20 000 заказов
+const MAX_ORDERS_LIMIT = 20000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UTC_OFFSET_HOURS = Number(process.env.REPORT_UTC_OFFSET_HOURS || 3);
 
@@ -41,19 +43,13 @@ function rub(value: number): string {
   return value.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function safe(value: string): string {
-  return value.replace(/[<>&]/g, '');
-}
+function safe(value: string): string { return value.replace(/[<>&]/g, ''); }
 
 function periodRange(period: StatsPeriod, now = new Date()) {
   const offset = UTC_OFFSET_HOURS * 60 * 60 * 1000;
   const localNow = new Date(now.getTime() + offset);
   const daysBack = period === 'week' ? 6 : 0;
-  const localStart = Date.UTC(
-    localNow.getUTCFullYear(),
-    localNow.getUTCMonth(),
-    localNow.getUTCDate() - daysBack
-  );
+  const localStart = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate() - daysBack);
   return { from: new Date(localStart - offset), to: now };
 }
 
@@ -62,9 +58,7 @@ function dateLabel(date: Date): string {
 }
 
 function titleFor(period: StatsPeriod, from: Date, to: Date): string {
-  return period === 'today'
-    ? `Сегодня, ${dateLabel(to)}`
-    : `Последние 7 дней: ${dateLabel(from)} — ${dateLabel(to)}`;
+  return period === 'today' ? `Сегодня, ${dateLabel(to)}` : `Последние 7 дней: ${dateLabel(from)} — ${dateLabel(to)}`;
 }
 
 function eventName(order: Order, refs: OrdersResponse['refs']): string {
@@ -77,15 +71,14 @@ const cache = new Map<string, { data: { text: string; reply_markup?: any }; expi
 const CACHE_TTL_MS = 30 * 1000;
 
 export const ticketscloudService = {
-  async getStats(apiKey?: string, period: StatsPeriod = 'today'): Promise<{ text: string; reply_markup?: any }> {
+  // 👇 Обрати внимание, сюда добавлен параметр commissionRate
+  async getStats(apiKey?: string, period: StatsPeriod = 'today', commissionRate: number = 0): Promise<{ text: string; reply_markup?: any }> {
     if (!apiKey?.trim()) {
-      return {
-        text: '⚠️ <b>API-ключ не указан!</b>',
-        reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] }
-      };
+      return { text: '⚠️ <b>API-ключ не указан!</b>', reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] } };
     }
 
-    const cacheKey = `${apiKey.trim()}_${period}`;
+    // Добавляем комиссию в ключ кэша, чтобы при смене комиссии кэш сбрасывался
+    const cacheKey = `${apiKey.trim()}_${period}_${commissionRate}`;
     const now = Date.now();
     const cachedItem = cache.get(cacheKey);
 
@@ -94,8 +87,6 @@ export const ticketscloudService = {
     }
 
     const { from, to } = periodRange(period);
-    
-    // Запрашиваем с запасом в 14 дней, чтобы поймать те корзины, которые висели в брони давно, а оплатили их только сейчас
     const queryFrom = new Date(from.getTime() - (14 * DAY_MS));
     
     const orders: Order[] = [];
@@ -106,7 +97,7 @@ export const ticketscloudService = {
     try {
       while (hasMorePages && orders.length < MAX_ORDERS_LIMIT) {
         const query = new URLSearchParams({
-          status: 'done', // Просим API дать только успешные
+          status: 'done,partially_refunded', 
           created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
           page: String(page),
           page_size: String(PAGE_SIZE)
@@ -124,11 +115,8 @@ export const ticketscloudService = {
         orders.push(...fetchedOrders);
         Object.assign(refs.events!, body.refs?.events || {});
         
-        if (fetchedOrders.length === PAGE_SIZE) {
-          page += 1;
-        } else {
-          hasMorePages = false; // Страницы закончились
-        }
+        if (fetchedOrders.length === PAGE_SIZE) page += 1;
+        else hasMorePages = false;
       }
     } catch (error: any) {
       return {
@@ -137,64 +125,73 @@ export const ticketscloudService = {
       };
     }
 
-    // ==========================================
-    // ЖЕСТКАЯ ФИЛЬТРАЦИЯ (УБИРАЕМ БРОНИ И МУСОР)
-    // ==========================================
     const selected = orders.filter(order => {
-      // 1. Если нет даты фактической оплаты (done_at) — это бронь или ошибка. ВЫКИДЫВАЕМ.
-      if (!order.done_at) return false;
-
-      // 2. Если API прислал статус, отличный от done (например, booked) — ВЫКИДЫВАЕМ.
-      if (order.status && order.status !== 'done') return false;
-
-      const completed = new Date(order.done_at);
+      const value = order.done_at || order.created_at;
+      if (!value) return false;
+      const completed = new Date(value);
       if (Number.isNaN(completed.valueOf())) return false;
-
-      // 3. Дата фактической оплаты должна попадать СТРОГО в запрошенный период!
       return completed >= from && completed <= to;
     });
 
-    let tickets = 0;
-    let sales = 0;
-    let full = 0;
-    let extra = 0;
-    let discount = 0;
+    let validTicketsCount = 0;
+    let grossSales = 0;
     const events = new Map<string, { orders: number; tickets: number; sales: number }>();
 
     for (const order of selected) {
       const orderTickets = Array.isArray(order.tickets) ? order.tickets : [];
-      const orderSales = number(order.values?.price ?? order.values?.nominal ?? order.values?.full);
-      
-      tickets += orderTickets.length;
-      sales += orderSales;
-      full += number(order.values?.full ?? order.values?.price);
-      extra += number(order.values?.extra);
-      discount += number(order.values?.discount);
+      let orderGross = 0;
+      let ticketsInOrder = 0;
 
-      const name = eventName(order, refs);
-      const stat = events.get(name) || { orders: 0, tickets: 0, sales: 0 };
-      stat.orders += 1;
-      stat.tickets += orderTickets.length;
-      stat.sales += orderSales;
-      events.set(name, stat);
+      for (const t of orderTickets) {
+        if (t.status === 'refunded' || t.status === 'returned' || t.status === 'canceled') continue;
+        ticketsInOrder++;
+        orderGross += number(t.price ?? t.full ?? 0);
+      }
+
+      if (orderTickets.length === 0 && order.status === 'done') {
+        orderGross = number(order.values?.price ?? order.values?.nominal);
+        ticketsInOrder = 1;
+      }
+
+      if (ticketsInOrder > 0) {
+        validTicketsCount += ticketsInOrder;
+        grossSales += orderGross;
+
+        const name = eventName(order, refs);
+        const stat = events.get(name) || { orders: 0, tickets: 0, sales: 0 };
+        stat.orders += 1;
+        stat.tickets += ticketsInOrder;
+        stat.sales += orderGross;
+        events.set(name, stat);
+      }
+    }
+
+    // 👇 МАТЕМАТИКА КОМИССИИ 👇
+    const commissionSum = grossSales * (commissionRate / 100);
+    const netSales = grossSales - commissionSum;
+
+    // Формируем блок текста о деньгах
+    let moneyText = `💳 Оборот (Грязными): <b>${rub(grossSales)} ₽</b>\n`;
+    if (commissionRate > 0) {
+      moneyText += `📉 Комиссия (${commissionRate}%): <b>- ${rub(commissionSum)} ₽</b>\n`;
+      moneyText += `💰 Чистый доход (к выплате): <b>${rub(netSales)} ₽</b>\n\n`;
+    } else {
+      moneyText += `<i>*Укажите % комиссии через команду /setkey чтобы видеть чистый доход</i>\n\n`;
     }
 
     const eventLines = Array.from(events.entries())
       .sort((a, b) => b[1].sales - a[1].sales)
       .slice(0, 10)
       .map(([name, stat]) =>
-        `🔹 <b>${safe(name)}</b>\n   • Продажи: <b>${rub(stat.sales)} ₽</b>\n   • Заказов: <b>${stat.orders}</b>\n   • Билетов: <b>${stat.tickets}</b>`
+        `🔹 <b>${safe(name)}</b>\n   • Оборот: <b>${rub(stat.sales)} ₽</b>\n   • Заказов: <b>${stat.orders}</b>\n   • Билетов: <b>${stat.tickets}</b>`
       );
 
     const resultData = {
       text:
         `📊 <b>${titleFor(period, from, to)}</b>\n\n` +
-        `💳 Продажи: <b>${rub(sales)} ₽</b>\n` +
-        `🧾 Сервисный сбор: <b>${rub(extra)} ₽</b>\n` +
-        `🏷 Скидки: <b>${rub(discount)} ₽</b>\n` +
-        `💰 Оплачено покупателями: <b>${rub(full)} ₽</b>\n\n` +
-        `🛒 Оплаченных заказов: <b>${selected.length}</b>\n` +
-        `🎟 Купленных билетов: <b>${tickets}</b>\n\n` +
+        moneyText +
+        `🛒 Успешных заказов: <b>${events.size > 0 ? Array.from(events.values()).reduce((acc, v) => acc + v.orders, 0) : 0}</b>\n` +
+        `🎟 Билетов на руках: <b>${validTicketsCount}</b>\n\n` +
         (eventLines.length ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}` : 'За выбранный период продаж нет.'),
       reply_markup: {
         inline_keyboard: [
