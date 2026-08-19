@@ -3,10 +3,11 @@ export type StatsPeriod = 'today' | 'week';
 type Money = string | number;
 
 type Order = {
+  status?: string; // Добавили поле статуса для проверки
   event?: string;
   created_at?: string;
-  done_at?: string;
-  tickets?: Array<{ full?: Money; price?: Money }>;
+  done_at?: string; // Дата фактической оплаты
+  tickets?: Array<any>;
   values?: {
     full?: Money;
     price?: Money;
@@ -19,16 +20,13 @@ type Order = {
 type OrdersResponse = {
   data?: Order[];
   pagination?: { page_size?: number; total?: number };
-  refs?: {
-    events?: Record<string, { title?: string | { text?: string } }>;
-  };
-  reason?: string;
-  message?: string;
-  errors?: string[];
+  refs?: { events?: Record<string, { title?: string | { text?: string } }> };
+  reason?: string; message?: string; errors?: string[];
 };
 
 const API_URL = `${(process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '')}/v2/resources/orders`;
 const PAGE_SIZE = 200;
+const MAX_ORDERS_LIMIT = 20000; // Тот самый лимит на 20 000 заказов
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UTC_OFFSET_HOURS = Number(process.env.REPORT_UTC_OFFSET_HOURS || 3);
 
@@ -40,10 +38,7 @@ function number(value: unknown): number {
 }
 
 function rub(value: number): string {
-  return value.toLocaleString('ru-RU', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  });
+  return value.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function safe(value: string): string {
@@ -63,11 +58,7 @@ function periodRange(period: StatsPeriod, now = new Date()) {
 }
 
 function dateLabel(date: Date): string {
-  return new Intl.DateTimeFormat('ru-RU', {
-    timeZone: 'Europe/Moscow',
-    day: 'numeric',
-    month: 'long'
-  }).format(date);
+  return new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Moscow', day: 'numeric', month: 'long' }).format(date);
 }
 
 function titleFor(period: StatsPeriod, from: Date, to: Date): string {
@@ -82,80 +73,85 @@ function eventName(order: Order, refs: OrdersResponse['refs']): string {
   return title?.text || 'Мероприятие без названия';
 }
 
+const cache = new Map<string, { data: { text: string; reply_markup?: any }; expiresAt: number }>();
+const CACHE_TTL_MS = 30 * 1000;
+
 export const ticketscloudService = {
-  async getStats(
-    apiKey?: string,
-    period: StatsPeriod = 'today'
-  ): Promise<{ text: string; reply_markup?: any }> {
+  async getStats(apiKey?: string, period: StatsPeriod = 'today'): Promise<{ text: string; reply_markup?: any }> {
     if (!apiKey?.trim()) {
       return {
         text: '⚠️ <b>API-ключ не указан!</b>',
-        reply_markup: {
-          inline_keyboard: [[{
-            text: '🔑 Указать API-ключ',
-            callback_data: 'prompt_set_key'
-          }]]
-        }
+        reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] }
       };
     }
 
+    const cacheKey = `${apiKey.trim()}_${period}`;
+    const now = Date.now();
+    const cachedItem = cache.get(cacheKey);
+
+    if (cachedItem && cachedItem.expiresAt > now) {
+      return { ...cachedItem.data, text: cachedItem.data.text + '\n\n<i>⚡ Данные из кэша (30 сек)</i>' };
+    }
+
     const { from, to } = periodRange(period);
-    const queryFrom = new Date(from.getTime() - DAY_MS);
+    
+    // Запрашиваем с запасом в 14 дней, чтобы поймать те корзины, которые висели в брони давно, а оплатили их только сейчас
+    const queryFrom = new Date(from.getTime() - (14 * DAY_MS));
+    
     const orders: Order[] = [];
     const refs: NonNullable<OrdersResponse['refs']> = { events: {} };
     let page = 1;
-    let pageCount = 1;
+    let hasMorePages = true;
 
     try {
-      do {
+      while (hasMorePages && orders.length < MAX_ORDERS_LIMIT) {
         const query = new URLSearchParams({
-          status: 'done',
+          status: 'done', // Просим API дать только успешные
           created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
           page: String(page),
           page_size: String(PAGE_SIZE)
         });
 
         const response = await fetch(`${API_URL}?${query}`, {
-          headers: {
-            Authorization: `key ${apiKey.trim()}`,
-            Accept: 'application/json'
-          },
+          headers: { Authorization: `key ${apiKey.trim()}`, Accept: 'application/json' },
           signal: AbortSignal.timeout(20_000)
         });
 
         const body = await response.json().catch(() => ({})) as OrdersResponse;
-        if (!response.ok) {
-          throw new Error(
-            body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`
-          );
-        }
+        if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
 
-        orders.push(...(Array.isArray(body.data) ? body.data : []));
+        const fetchedOrders = Array.isArray(body.data) ? body.data : [];
+        orders.push(...fetchedOrders);
         Object.assign(refs.events!, body.refs?.events || {});
-        const total = body.pagination?.total ?? orders.length;
-        const size = body.pagination?.page_size || PAGE_SIZE;
-        pageCount = Math.max(1, Math.ceil(total / size));
-        page += 1;
-      } while (page <= pageCount);
+        
+        if (fetchedOrders.length === PAGE_SIZE) {
+          page += 1;
+        } else {
+          hasMorePages = false; // Страницы закончились
+        }
+      }
     } catch (error: any) {
       return {
-        text:
-          '⚠️ <b>Не удалось получить статистику Ticketscloud</b>\n\n' +
-          `API вернул: <code>${safe(String(error.message || error))}</code>`,
-        reply_markup: {
-          inline_keyboard: [[{
-            text: '🔄 Повторить',
-            callback_data: period === 'week' ? 'stats_week' : 'stats_today'
-          }]]
-        }
+        text: `⚠️ <b>Не удалось получить статистику</b>\nAPI вернул: <code>${safe(String(error.message || error))}</code>`,
+        reply_markup: { inline_keyboard: [[{ text: '🔄 Повторить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]] }
       };
     }
 
+    // ==========================================
+    // ЖЕСТКАЯ ФИЛЬТРАЦИЯ (УБИРАЕМ БРОНИ И МУСОР)
+    // ==========================================
     const selected = orders.filter(order => {
-      const value = order.done_at || order.created_at;
-      if (!value) return false;
-      const completed = new Date(value);
-      return !Number.isNaN(completed.valueOf()) && completed >= from && completed <= to;
+      // 1. Если нет даты фактической оплаты (done_at) — это бронь или ошибка. ВЫКИДЫВАЕМ.
+      if (!order.done_at) return false;
+
+      // 2. Если API прислал статус, отличный от done (например, booked) — ВЫКИДЫВАЕМ.
+      if (order.status && order.status !== 'done') return false;
+
+      const completed = new Date(order.done_at);
+      if (Number.isNaN(completed.valueOf())) return false;
+
+      // 3. Дата фактической оплаты должна попадать СТРОГО в запрошенный период!
+      return completed >= from && completed <= to;
     });
 
     let tickets = 0;
@@ -168,6 +164,7 @@ export const ticketscloudService = {
     for (const order of selected) {
       const orderTickets = Array.isArray(order.tickets) ? order.tickets : [];
       const orderSales = number(order.values?.price ?? order.values?.nominal ?? order.values?.full);
+      
       tickets += orderTickets.length;
       sales += orderSales;
       full += number(order.values?.full ?? order.values?.price);
@@ -186,42 +183,31 @@ export const ticketscloudService = {
       .sort((a, b) => b[1].sales - a[1].sales)
       .slice(0, 10)
       .map(([name, stat]) =>
-        `🔹 <b>${safe(name)}</b>\n` +
-        `   • Продажи: <b>${rub(stat.sales)} ₽</b>\n` +
-        `   • Заказов: <b>${stat.orders}</b>\n` +
-        `   • Билетов: <b>${stat.tickets}</b>`
+        `🔹 <b>${safe(name)}</b>\n   • Продажи: <b>${rub(stat.sales)} ₽</b>\n   • Заказов: <b>${stat.orders}</b>\n   • Билетов: <b>${stat.tickets}</b>`
       );
 
-    return {
+    const resultData = {
       text:
         `📊 <b>${titleFor(period, from, to)}</b>\n\n` +
         `💳 Продажи: <b>${rub(sales)} ₽</b>\n` +
         `🧾 Сервисный сбор: <b>${rub(extra)} ₽</b>\n` +
         `🏷 Скидки: <b>${rub(discount)} ₽</b>\n` +
         `💰 Оплачено покупателями: <b>${rub(full)} ₽</b>\n\n` +
-        `🛒 Заказов: <b>${selected.length}</b>\n` +
-        `🎟 Билетов: <b>${tickets}</b>\n\n` +
-        (eventLines.length
-          ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}`
-          : 'За выбранный период продаж нет.'),
+        `🛒 Оплаченных заказов: <b>${selected.length}</b>\n` +
+        `🎟 Купленных билетов: <b>${tickets}</b>\n\n` +
+        (eventLines.length ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}` : 'За выбранный период продаж нет.'),
       reply_markup: {
         inline_keyboard: [
           [
-            {
-              text: period === 'today' ? '✅ Сегодня' : '📊 Сегодня',
-              callback_data: 'stats_today'
-            },
-            {
-              text: period === 'week' ? '✅ 7 дней' : '📅 7 дней',
-              callback_data: 'stats_week'
-            }
+            { text: period === 'today' ? '✅ Сегодня' : '📊 Сегодня', callback_data: 'stats_today' },
+            { text: period === 'week' ? '✅ 7 дней' : '📅 7 дней', callback_data: 'stats_week' }
           ],
-          [{
-            text: '🔄 Обновить',
-            callback_data: period === 'week' ? 'stats_week' : 'stats_today'
-          }]
+          [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]
         ]
       }
     };
+
+    cache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
+    return resultData;
   }
 };
