@@ -27,8 +27,10 @@ class TelegramBotEngine {
     this.initializeDefaultCommands();
     this.addLog('system', 'Telegram Bot Engine initialized', 'Ready to start');
     
-    this.startEngine();
-    setInterval(() => this.cleanupStaleSessions(), 1000 * 60 * 60);
+    // Запуск выполняют server.ts или Vite dev server. Конструктор не должен
+    // открывать сетевые соединения во время импорта (например, при сборке).
+    const cleanupTimer = setInterval(() => this.cleanupStaleSessions(), 1000 * 60 * 60);
+    cleanupTimer.unref();
   }
 
   private initializeDefaultCommands() {
@@ -44,7 +46,7 @@ class TelegramBotEngine {
             { text: '📊 Статистика продаж', callback_data: 'stats_today' }
           ],
           [
-            { text: '🔑 Указать API-ключ и Комиссию', callback_data: 'prompt_set_key' },
+            { text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' },
             { text: '💬 Поддержка', callback_data: 'btn_support' }
           ]
         ],
@@ -71,7 +73,7 @@ class TelegramBotEngine {
         responseText: 'ℹ️ <b>Справка по командам:</b>\n\n' +
           '• <code>/start</code> — Главное меню и приветствие\n' +
           '• <code>/stats</code> — Сводка по продажам TicketsCloud\n' +
-          '• <code>/setkey [КЛЮЧ] [КОМИССИЯ]</code> — Указать API Key и ваш % комиссии\n' +
+          '• <code>/setkey [КЛЮЧ]</code> — Указать TicketsCloud API-ключ\n' +
           '• <code>/help</code> — Справка по работе с ботом',
         enabled: true
       }
@@ -106,7 +108,7 @@ class TelegramBotEngine {
       if (!webhookResult.ok) throw new Error(webhookResult.description || 'Не удалось отключить webhook');
       
       this.botInfo = await telegramApi.getMe(this.config.token);
-      this.addLog('system', 'Telegram Token Connected', `@${this.botInfo.username}`);
+      this.addLog('system', 'Telegram Token Connected', `@${this.botInfo?.username || 'unknown'}`);
       this.syncCommandsToTelegram().catch(() => {});
     } catch (err: any) { this.addLog('error', 'Failed to connect', err.message); }
 
@@ -144,19 +146,9 @@ class TelegramBotEngine {
     else if (update.callback_query) await this.handleCallbackQuery(update.callback_query, update);
   }
 
-  // --- Хелпер для парсинга ключа и комиссии ---
-  private processKeyInput(text: string, userId: number) {
-    const parts = text.trim().split(/\s+/);
-    const key = parts[0];
-    let commission = 0;
-    if (parts.length > 1) {
-      commission = parseFloat(parts[1].replace(',', '.'));
-      if (isNaN(commission)) commission = 0;
-    }
-    // Сохраняем в JSON и шифруем всё вместе
-    const payload = JSON.stringify({ k: key, c: commission });
-    this.userApiKeys.set(userId, encryptApiKey(payload));
-    return commission;
+  private saveApiKey(text: string, userId: number) {
+    const key = text.trim();
+    this.userApiKeys.set(userId, encryptApiKey(key));
   }
 
   private async handleMessage(msg: any, rawUpdate: TelegramUpdate) {
@@ -168,13 +160,12 @@ class TelegramBotEngine {
     this.recordUserMessage(chatId, user, text, 'user');
     this.addLog('incoming_msg', `Message from ${username}`, text, chatId, username, rawUpdate);
 
-    // 1. Ожидание ввода ключа и комиссии
+    // 1. Ожидание ввода API-ключа
     if (this.awaitingKeyUsers.has(user.id) && !text.startsWith('/')) {
-      const comm = this.processKeyInput(text, user.id);
+      this.saveApiKey(text, user.id);
       this.awaitingKeyUsers.delete(user.id);
       
-      const commText = comm > 0 ? `с учетом комиссии <b>${comm}%</b> ` : '';
-      await this.sendBotReply(chatId, `✅ <b>API-ключ успешно сохранен!</b>\nСтатистика будет рассчитываться ${commText}!\n\nНажмите кнопку ниже:`, [
+      await this.sendBotReply(chatId, '✅ <b>API-ключ успешно сохранён!</b>\n\nНажмите кнопку ниже:', [
           [{ text: '📊 Посмотреть статистику', callback_data: 'stats_today' }]
         ]
       );
@@ -185,15 +176,14 @@ class TelegramBotEngine {
     if (text.startsWith('/setkey')) {
       const input = text.replace('/setkey', '').trim();
       if (!input) {
-        await this.sendBotReply(chatId, '✏️ <b>Отправьте команду с ключом и комиссией через пробел:</b>\n\n<code>/setkey ВАШ_КЛЮЧ 6.7</code>\n\n<i>Где 6.7 - это ваш процент комиссии TicketsCloud.</i>');
+        await this.sendBotReply(chatId, '✏️ <b>Укажите API-ключ после команды:</b>\n\n<code>/setkey ВАШ_КЛЮЧ</code>');
         return;
       }
       
-      const comm = this.processKeyInput(input, user.id);
+      this.saveApiKey(input, user.id);
       this.awaitingKeyUsers.delete(user.id);
       
-      const commText = comm > 0 ? `\nЗадана комиссия: <b>${comm}%</b>` : '';
-      await this.sendBotReply(chatId, `✅ <b>API-ключ успешно сохранен!</b>${commText}`, [
+      await this.sendBotReply(chatId, '✅ <b>API-ключ успешно сохранён!</b>', [
           [{ text: '📊 Посмотреть статистику', callback_data: 'stats_today' }]
         ]
       );
@@ -234,7 +224,7 @@ class TelegramBotEngine {
 
     if (data === 'prompt_set_key') {
       this.awaitingKeyUsers.add(user.id);
-      await this.sendBotReply(chatId, '🔑 <b>Отправьте ваш TicketsCloud API Key и % комиссии через пробел</b>\n\nПример сообщения:\n<code>ВАШ_КЛЮЧ 6.7</code>\n\n<i>(Если укажете комиссию, бот автоматически рассчитает чистую прибыль к выплате)</i>');
+      await this.sendBotReply(chatId, '🔑 <b>Отправьте ваш TicketsCloud API-ключ</b>\n\nПример сообщения:\n<code>ВАШ_КЛЮЧ</code>');
       return;
     }
 
@@ -248,23 +238,19 @@ class TelegramBotEngine {
     const encryptedKey = this.userApiKeys.get(userId) || '';
     try { if (this.config.token) await telegramApi.sendChatAction(this.config.token, chatId, 'typing'); } catch (e) {}
 
-    // --- Расшифровка и извлечение комиссии ---
     let realApiKey = '';
-    let commission = 0;
 
     if (encryptedKey) {
       const decrypted = decryptApiKey(encryptedKey);
       try {
         const parsed = JSON.parse(decrypted);
         realApiKey = parsed.k;
-        commission = parsed.c || 0;
       } catch (e) {
         realApiKey = decrypted; // Для обратной совместимости, если ключ сохраняли до этого обновления
       }
     }
     
-    // Передаем комиссию в сервис!
-    const res = await ticketscloudService.getStats(realApiKey, period, commission);
+    const res = await ticketscloudService.getStats(realApiKey, period);
     await this.sendBotReply(chatId, res.text, res.reply_markup?.inline_keyboard);
   }
 

@@ -1,225 +1,207 @@
 export type StatsPeriod = 'today' | 'week';
 
 type Money = string | number;
+type LocalizedTitle = string | { text?: string };
 
-type Ticket = {
-  status?: string;
-  price?: Money;
-  full?: Money;
-  nominal?: Money;
-  [key: string]: any;
+type AnalyticsRow = {
+  meta_event?: string | { id?: string; title?: LocalizedTitle };
+  key?: string;
+  id?: string;
+  title?: LocalizedTitle;
+  name?: string;
+  value?: Money;
+  count?: Money;
+  tickets?: Money;
+  tickets_count?: Money;
+  quantity?: Money;
+  orders?: Money;
+  orders_count?: Money;
+  values?: { full?: Money; price?: Money; nominal?: Money; extra?: Money };
 };
 
-type Order = {
-  status?: string;
-  event?: string;
-  created_at?: string;
-  done_at?: string;
-  tickets?: Ticket[];
-  values?: { full?: Money; price?: Money; nominal?: Money; extra?: Money; discount?: Money; };
+type AnalyticsResponse = {
+  data?: AnalyticsRow[] | { items?: AnalyticsRow[]; results?: AnalyticsRow[] };
+  results?: AnalyticsRow[];
+  pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
+  refs?: { meta_events?: Record<string, { title?: LocalizedTitle; name?: string }> };
+  reason?: string;
+  message?: string;
+  errors?: string[];
 };
 
-type OrdersResponse = {
-  data?: Order[];
-  pagination?: { page_size?: number; total?: number };
-  refs?: { events?: Record<string, { title?: string | { text?: string } }> };
-  reason?: string; message?: string; errors?: string[];
+export type AnalyticsStats = { title: string; revenue: number; tickets: number; orders: number };
+
+type BotStatsResponse = {
+  text: string;
+  reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 };
 
-const API_URL = `${(process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '')}/v2/resources/orders`;
-const PAGE_SIZE = 200;
-const MAX_ORDERS_LIMIT = 20000;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const UTC_OFFSET_HOURS = Number(process.env.REPORT_UTC_OFFSET_HOURS || 3);
+const API_BASE_URL = (process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '');
+const ANALYTICS_PATH = '/v2/services/analytics/org/group_by/meta_events';
+const PAGE_SIZE = 20;
+const MAX_PAGES = 1_000;
+const CACHE_TTL_MS = 30_000;
+const REPORT_TIME_ZONE = process.env.REPORT_TIME_ZONE || 'Europe/Moscow';
+const cache = new Map<string, { data: BotStatsResponse; expiresAt: number }>();
 
-function number(value: unknown): number {
+function asNumber(value: unknown): number {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if (typeof value !== 'string') return 0;
   const parsed = Number(value.replace(/\s/g, '').replace(',', '.'));
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function rub(value: number): string {
+function escapeHtml(value: unknown): string {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function money(value: number): string {
   return value.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function safe(value: string): string { return value.replace(/[<>&]/g, ''); }
+function titleText(value: LocalizedTitle | undefined): string | undefined {
+  return typeof value === 'string' ? value : value?.text;
+}
 
-function periodRange(period: StatsPeriod, now = new Date()) {
-  const offset = UTC_OFFSET_HOURS * 60 * 60 * 1000;
-  const localNow = new Date(now.getTime() + offset);
-  const daysBack = period === 'week' ? 6 : 0;
-  const localStart = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate() - daysBack);
-  return { from: new Date(localStart - offset), to: now };
+function rowsFrom(body: AnalyticsResponse): AnalyticsRow[] {
+  if (Array.isArray(body.data)) return body.data;
+  if (Array.isArray(body.data?.items)) return body.data.items;
+  if (Array.isArray(body.data?.results)) return body.data.results;
+  return Array.isArray(body.results) ? body.results : [];
+}
+
+function metaEventId(row: AnalyticsRow): string | undefined {
+  if (typeof row.meta_event === 'string') return row.meta_event;
+  return row.meta_event?.id || row.key || row.id;
+}
+
+function rowTitle(row: AnalyticsRow, refs: AnalyticsResponse['refs']): string {
+  const id = metaEventId(row);
+  const ref = id ? refs?.meta_events?.[id] : undefined;
+  return titleText(row.meta_event && typeof row.meta_event === 'object' ? row.meta_event.title : undefined)
+    || titleText(row.title) || titleText(ref?.title) || row.name || ref?.name
+    || (id ? `Мероприятие ${id}` : 'Мероприятие без названия');
+}
+
+export function normalizeAnalyticsRow(row: AnalyticsRow, refs?: AnalyticsResponse['refs']): AnalyticsStats {
+  return {
+    title: rowTitle(row, refs),
+    revenue: asNumber(row.value ?? row.values?.full ?? row.values?.price ?? row.values?.nominal),
+    tickets: asNumber(row.tickets_count ?? row.tickets ?? row.quantity ?? row.count),
+    orders: asNumber(row.orders_count ?? row.orders)
+  };
+}
+
+function zonedParts(date: Date): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: REPORT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find(part => part.type === type)?.value);
+  return { year: value('year'), month: value('month'), day: value('day') };
+}
+
+function timeZoneOffsetMs(date: Date): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: REPORT_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find(part => part.type === type)?.value);
+  return Date.UTC(value('year'), value('month') - 1, value('day'), value('hour'), value('minute'), value('second')) - date.getTime();
+}
+
+function zonedMidnightUtc(date: Date, daysBack: number): Date {
+  const { year, month, day } = zonedParts(date);
+  const localMidnightAsUtc = new Date(Date.UTC(year, month - 1, day - daysBack));
+  return new Date(localMidnightAsUtc.getTime() - timeZoneOffsetMs(localMidnightAsUtc));
+}
+
+export function periodRange(period: StatsPeriod, now = new Date()): { from: Date; to: Date } {
+  return { from: zonedMidnightUtc(now, period === 'week' ? 6 : 0), to: now };
+}
+
+function apiDate(date: Date): string {
+  return date.toISOString().replace('.000Z', 'Z');
 }
 
 function dateLabel(date: Date): string {
-  return new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Moscow', day: 'numeric', month: 'long' }).format(date);
+  return new Intl.DateTimeFormat('ru-RU', { timeZone: REPORT_TIME_ZONE, day: 'numeric', month: 'long' }).format(date);
 }
 
-function titleFor(period: StatsPeriod, from: Date, to: Date): string {
+function periodTitle(period: StatsPeriod, from: Date, to: Date): string {
   return period === 'today' ? `Сегодня, ${dateLabel(to)}` : `Последние 7 дней: ${dateLabel(from)} — ${dateLabel(to)}`;
 }
 
-function eventName(order: Order, refs: OrdersResponse['refs']): string {
-  const title = order.event ? refs?.events?.[order.event]?.title : undefined;
-  if (typeof title === 'string') return title;
-  return title?.text || 'Мероприятие без названия';
+async function fetchAllAnalytics(apiKey: string, from: Date, to: Date): Promise<AnalyticsStats[]> {
+  const result: AnalyticsStats[] = [];
+  let page = 1;
+  while (page <= MAX_PAGES) {
+    const query = new URLSearchParams({
+      sort: '-value', done_at: `${apiDate(from)},${apiDate(to)}`,
+      page_size: String(PAGE_SIZE), page: String(page)
+    });
+    const response = await fetch(`${API_BASE_URL}${ANALYTICS_PATH}?${query}`, {
+      headers: { Authorization: `key ${apiKey}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(20_000)
+    });
+    const body = await response.json().catch(() => ({})) as AnalyticsResponse;
+    if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+
+    const rows = rowsFrom(body);
+    result.push(...rows.map(row => normalizeAnalyticsRow(row, body.refs)));
+    const totalPages = body.pagination?.pages
+      || (body.pagination?.total ? Math.ceil(body.pagination.total / (body.pagination.page_size || PAGE_SIZE)) : undefined);
+    if (!(totalPages !== undefined ? page < totalPages : rows.length === PAGE_SIZE)) break;
+    page += 1;
+  }
+  if (page > MAX_PAGES) throw new Error('Превышен лимит страниц аналитики');
+  return result;
 }
 
-const cache = new Map<string, { data: { text: string; reply_markup?: any }; expiresAt: number }>();
-const CACHE_TTL_MS = 30 * 1000;
-
 export const ticketscloudService = {
-  async getStats(apiKey?: string, period: StatsPeriod = 'today', commissionRate: number = 0): Promise<{ text: string; reply_markup?: any }> {
-    if (!apiKey?.trim()) {
-      return { text: '⚠️ <b>API-ключ не указан!</b>', reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] } };
-    }
-
-    const cacheKey = `${apiKey.trim()}_${period}_${commissionRate}`;
-    const now = Date.now();
-    const cachedItem = cache.get(cacheKey);
-
-    if (cachedItem && cachedItem.expiresAt > now) {
-      return { ...cachedItem.data, text: cachedItem.data.text + '\n\n<i>⚡ Данные из кэша (30 сек)</i>' };
-    }
+  async getStats(apiKey?: string, period: StatsPeriod = 'today'): Promise<BotStatsResponse> {
+    const normalizedKey = apiKey?.trim();
+    if (!normalizedKey) return {
+      text: '⚠️ <b>API-ключ не указан!</b>',
+      reply_markup: { inline_keyboard: [[{ text: '🔑 Указать API-ключ', callback_data: 'prompt_set_key' }]] }
+    };
 
     const { from, to } = periodRange(period);
-    const queryFrom = new Date(from.getTime() - (14 * DAY_MS));
-    
-    const orders: Order[] = [];
-    const refs: NonNullable<OrdersResponse['refs']> = { events: {} };
-    let page = 1;
-    let hasMorePages = true;
+    const cacheKey = `${normalizedKey}_${period}_${apiDate(from).slice(0, 13)}`;
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return { ...cached.data, text: `${cached.data.text}\n\n<i>⚡ Данные из кэша (30 сек)</i>` };
 
+    let stats: AnalyticsStats[];
     try {
-      while (hasMorePages && orders.length < MAX_ORDERS_LIMIT) {
-        // Убрали строгий status, чтобы API отдал нам и возвращенные заказы тоже
-        const query = new URLSearchParams({
-          created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
-          page: String(page),
-          page_size: String(PAGE_SIZE)
-        });
-
-        const response = await fetch(`${API_URL}?${query}`, {
-          headers: { Authorization: `key ${apiKey.trim()}`, Accept: 'application/json' },
-          signal: AbortSignal.timeout(20_000)
-        });
-
-        const body = await response.json().catch(() => ({})) as OrdersResponse;
-        if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
-
-        const fetchedOrders = Array.isArray(body.data) ? body.data : [];
-        orders.push(...fetchedOrders);
-        Object.assign(refs.events!, body.refs?.events || {});
-        
-        if (fetchedOrders.length === PAGE_SIZE) page += 1;
-        else hasMorePages = false;
-      }
+      stats = await fetchAllAnalytics(normalizedKey, from, to);
     } catch (error: any) {
       return {
-        text: `⚠️ <b>Не удалось получить статистику</b>\nAPI вернул: <code>${safe(String(error.message || error))}</code>`,
+        text: `⚠️ <b>Не удалось получить статистику</b>\nAPI вернул: <code>${escapeHtml(error?.message || error)}</code>`,
         reply_markup: { inline_keyboard: [[{ text: '🔄 Повторить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]] }
       };
     }
 
-    const validStatuses = ['done', 'partially_refunded', 'refunded', 'returned'];
-
-    const selected = orders.filter(order => {
-      // Оставляем только успешные или возвращенные
-      if (!order.status || !validStatuses.includes(order.status.toLowerCase())) return false;
-      
-      const value = order.done_at || order.created_at;
-      if (!value) return false;
-      const completed = new Date(value);
-      if (Number.isNaN(completed.valueOf())) return false;
-      return completed >= from && completed <= to;
+    const totalRevenue = stats.reduce((sum, item) => sum + item.revenue, 0);
+    const totalTickets = stats.reduce((sum, item) => sum + item.tickets, 0);
+    const totalOrders = stats.reduce((sum, item) => sum + item.orders, 0);
+    const eventLines = stats.sort((a, b) => b.revenue - a.revenue).slice(0, 10).map(item => {
+      const counts = [item.tickets > 0 ? `Билетов: <b>${item.tickets}</b>` : '', item.orders > 0 ? `Заказов: <b>${item.orders}</b>` : '']
+        .filter(Boolean).join(' · ');
+      return `🔹 <b>${escapeHtml(item.title)}</b>\n   • Оборот: <b>${money(item.revenue)} ₽</b>${counts ? `\n   • ${counts}` : ''}`;
     });
 
-    let totalSales = 0;
-    let totalExtra = 0;
-    let totalRefundsAmount = 0;
-    let ticketsSold = 0;
-    let ticketsRefunded = 0;
-    let validOrders = 0;
-
-    const events = new Map<string, { orders: number; tickets: number; sales: number }>();
-
-    for (const order of selected) {
-      const orderSales = number(order.values?.price ?? order.values?.nominal ?? order.values?.full);
-      const orderExtra = number(order.values?.extra);
-      const orderTickets = Array.isArray(order.tickets) ? order.tickets : [];
-      
-      // Игнорируем заказы-пустышки
-      if (orderSales === 0 && orderTickets.length === 0) continue;
-
-      validOrders++;
-      totalSales += orderSales;
-      totalExtra += orderExtra;
-      ticketsSold += orderTickets.length;
-
-      let validTicketsInOrder = 0;
-
-      for (const t of orderTickets) {
-        if (t.status === 'refunded' || t.status === 'returned' || t.status === 'canceled') {
-          ticketsRefunded++;
-          totalRefundsAmount += number(t.price ?? t.nominal ?? t.full ?? 0);
-        } else {
-          validTicketsInOrder++;
-        }
-      }
-
-      const name = eventName(order, refs);
-      const stat = events.get(name) || { orders: 0, tickets: 0, sales: 0 };
-      stat.orders += 1;
-      stat.tickets += validTicketsInOrder;
-      stat.sales += orderSales;
-      events.set(name, stat);
-    }
-
-    // Воспроизводим формулу из дашборда
-    const grossBaseForCommission = totalSales + totalExtra - totalRefundsAmount;
-    const commissionSum = grossBaseForCommission * (commissionRate / 100);
-    const netSales = grossBaseForCommission - commissionSum;
-
-    let moneyText = `💳 Продажи: <b>${rub(totalSales)} ₽</b> (${ticketsSold} шт.)\n`;
-    moneyText += `🧾 Сервисный сбор: <b>${rub(totalExtra)} ₽</b>\n`;
-    
-    if (totalRefundsAmount > 0) {
-      moneyText += `↩️ Возвраты: <b>- ${rub(totalRefundsAmount)} ₽</b> (${ticketsRefunded} шт.)\n`;
-    }
-
-    if (commissionRate > 0) {
-      moneyText += `📉 Комиссия (${commissionRate}%): <b>- ${rub(commissionSum)} ₽</b>\n`;
-      moneyText += `💰 <b>Доход (к выплате): ${rub(netSales)} ₽</b>\n\n`;
-    } else {
-      moneyText += `\n<i>*Укажите % комиссии через /setkey для расчета дохода</i>\n\n`;
-    }
-
-    const eventLines = Array.from(events.entries())
-      .sort((a, b) => b[1].sales - a[1].sales)
-      .slice(0, 10)
-      .map(([name, stat]) =>
-        `🔹 <b>${safe(name)}</b>\n   • Оборот: <b>${rub(stat.sales)} ₽</b>\n   • Заказов: <b>${stat.orders}</b>\n   • Билетов: <b>${stat.tickets}</b>`
-      );
-
-    const resultData = {
-      text:
-        `📊 <b>${titleFor(period, from, to)}</b>\n\n` +
-        moneyText +
-        (eventLines.length ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}` : 'За выбранный период продаж нет.'),
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: period === 'today' ? '✅ Сегодня' : '📊 Сегодня', callback_data: 'stats_today' },
-            { text: period === 'week' ? '✅ 7 дней' : '📅 7 дней', callback_data: 'stats_week' }
-          ],
-          [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]
-        ]
-      }
+    let totals = `💳 Оборот: <b>${money(totalRevenue)} ₽</b>`;
+    if (totalTickets > 0) totals += ` (${totalTickets} бил.)`;
+    if (totalOrders > 0) totals += `\n🧾 Заказов: <b>${totalOrders}</b>`;
+    const data: BotStatsResponse = {
+      text: `📊 <b>${periodTitle(period, from, to)}</b>\n\n${totals}\n\n`
+        + (eventLines.length ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}` : 'За выбранный период продаж нет.'),
+      reply_markup: { inline_keyboard: [
+        [{ text: period === 'today' ? '✅ Сегодня' : '📊 Сегодня', callback_data: 'stats_today' },
+          { text: period === 'week' ? '✅ 7 дней' : '📅 7 дней', callback_data: 'stats_week' }],
+        [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]
+      ] }
     };
-
-    cache.set(cacheKey, { data: resultData, expiresAt: Date.now() + CACHE_TTL_MS });
-    return resultData;
+    cache.set(cacheKey, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+    return data;
   }
 };
