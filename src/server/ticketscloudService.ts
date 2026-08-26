@@ -94,8 +94,8 @@ export const ticketscloudService = {
 
     try {
       while (hasMorePages && orders.length < MAX_ORDERS_LIMIT) {
+        // Убрали строгий status, чтобы API отдал нам и возвращенные заказы тоже
         const query = new URLSearchParams({
-          status: 'done', // 👈 Вот здесь строгий статус, из-за которого была ошибка
           created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
           page: String(page),
           page_size: String(PAGE_SIZE)
@@ -123,7 +123,12 @@ export const ticketscloudService = {
       };
     }
 
+    const validStatuses = ['done', 'partially_refunded', 'refunded', 'returned'];
+
     const selected = orders.filter(order => {
+      // Оставляем только успешные или возвращенные
+      if (!order.status || !validStatuses.includes(order.status.toLowerCase())) return false;
+      
       const value = order.done_at || order.created_at;
       if (!value) return false;
       const completed = new Date(value);
@@ -131,48 +136,64 @@ export const ticketscloudService = {
       return completed >= from && completed <= to;
     });
 
-    let validTicketsCount = 0;
-    let grossSales = 0;
+    let totalSales = 0;
+    let totalExtra = 0;
+    let totalRefundsAmount = 0;
+    let ticketsSold = 0;
+    let ticketsRefunded = 0;
+    let validOrders = 0;
+
     const events = new Map<string, { orders: number; tickets: number; sales: number }>();
 
     for (const order of selected) {
+      const orderSales = number(order.values?.price ?? order.values?.nominal ?? order.values?.full);
+      const orderExtra = number(order.values?.extra);
       const orderTickets = Array.isArray(order.tickets) ? order.tickets : [];
-      let orderGross = 0;
-      let ticketsInOrder = 0;
+      
+      // Игнорируем заказы-пустышки
+      if (orderSales === 0 && orderTickets.length === 0) continue;
+
+      validOrders++;
+      totalSales += orderSales;
+      totalExtra += orderExtra;
+      ticketsSold += orderTickets.length;
+
+      let validTicketsInOrder = 0;
 
       for (const t of orderTickets) {
-        if (t.status === 'refunded' || t.status === 'returned' || t.status === 'canceled') continue;
-        ticketsInOrder++;
-        orderGross += number(t.price ?? t.full ?? 0);
+        if (t.status === 'refunded' || t.status === 'returned' || t.status === 'canceled') {
+          ticketsRefunded++;
+          totalRefundsAmount += number(t.price ?? t.nominal ?? t.full ?? 0);
+        } else {
+          validTicketsInOrder++;
+        }
       }
 
-      if (orderTickets.length === 0 && order.status === 'done') {
-        orderGross = number(order.values?.price ?? order.values?.nominal);
-        ticketsInOrder = 1;
-      }
-
-      if (ticketsInOrder > 0) {
-        validTicketsCount += ticketsInOrder;
-        grossSales += orderGross;
-
-        const name = eventName(order, refs);
-        const stat = events.get(name) || { orders: 0, tickets: 0, sales: 0 };
-        stat.orders += 1;
-        stat.tickets += ticketsInOrder;
-        stat.sales += orderGross;
-        events.set(name, stat);
-      }
+      const name = eventName(order, refs);
+      const stat = events.get(name) || { orders: 0, tickets: 0, sales: 0 };
+      stat.orders += 1;
+      stat.tickets += validTicketsInOrder;
+      stat.sales += orderSales;
+      events.set(name, stat);
     }
 
-    const commissionSum = grossSales * (commissionRate / 100);
-    const netSales = grossSales - commissionSum;
+    // Воспроизводим формулу из дашборда
+    const grossBaseForCommission = totalSales + totalExtra - totalRefundsAmount;
+    const commissionSum = grossBaseForCommission * (commissionRate / 100);
+    const netSales = grossBaseForCommission - commissionSum;
 
-    let moneyText = `💳 Оборот (Грязными): <b>${rub(grossSales)} ₽</b>\n`;
+    let moneyText = `💳 Продажи: <b>${rub(totalSales)} ₽</b> (${ticketsSold} шт.)\n`;
+    moneyText += `🧾 Сервисный сбор: <b>${rub(totalExtra)} ₽</b>\n`;
+    
+    if (totalRefundsAmount > 0) {
+      moneyText += `↩️ Возвраты: <b>- ${rub(totalRefundsAmount)} ₽</b> (${ticketsRefunded} шт.)\n`;
+    }
+
     if (commissionRate > 0) {
       moneyText += `📉 Комиссия (${commissionRate}%): <b>- ${rub(commissionSum)} ₽</b>\n`;
-      moneyText += `💰 Чистый доход (к выплате): <b>${rub(netSales)} ₽</b>\n\n`;
+      moneyText += `💰 <b>Доход (к выплате): ${rub(netSales)} ₽</b>\n\n`;
     } else {
-      moneyText += `<i>*Укажите % комиссии через команду /setkey чтобы видеть чистый доход</i>\n\n`;
+      moneyText += `\n<i>*Укажите % комиссии через /setkey для расчета дохода</i>\n\n`;
     }
 
     const eventLines = Array.from(events.entries())
@@ -186,8 +207,6 @@ export const ticketscloudService = {
       text:
         `📊 <b>${titleFor(period, from, to)}</b>\n\n` +
         moneyText +
-        `🛒 Успешных заказов: <b>${events.size > 0 ? Array.from(events.values()).reduce((acc, v) => acc + v.orders, 0) : 0}</b>\n` +
-        `🎟 Билетов на руках: <b>${validTicketsCount}</b>\n\n` +
         (eventLines.length ? `<b>По мероприятиям:</b>\n${eventLines.join('\n\n')}` : 'За выбранный период продаж нет.'),
       reply_markup: {
         inline_keyboard: [
