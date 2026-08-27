@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregateOrders, ticketscloudService } from '../src/server/ticketscloudService.ts';
+import { aggregateOrders, periodRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
+
+test('matches the dashboard week boundaries in Moscow time', () => {
+  const range = periodRange('week', new Date('2026-08-27T07:27:00Z'));
+  assert.equal(range.from.toISOString(), '2026-08-19T21:00:00.000Z');
+  assert.equal(range.to.toISOString(), '2026-08-27T07:27:00.000Z');
+});
 
 test('uses full sales value and separates successful orders from refunds', () => {
   const stats = aggregateOrders([
@@ -40,26 +46,30 @@ test('uses orders endpoint, key authentication and every page', async () => {
     const page = Number(url.searchParams.get('page'));
     const now = new Date(Date.now() - 60_000).toISOString();
     const rows = page === 1
-      ? Array.from({ length: 200 }, (_, index) => ({
+      // API может вернуть меньше запрошенного page_size и не прислать
+      // надёжную pagination-секцию — всё равно проверяем следующую страницу.
+      ? Array.from({ length: 20 }, (_, index) => ({
+          id: `order-${index}`,
           status: 'done', event: `event-${index}`, done_at: now,
           values: { full: 100, price: 90 }, tickets: [{ status: 'done', full: 100 }]
         }))
-      : [{ status: 'done', event: 'last-event', done_at: now, values: { full: 50 }, tickets: [] }];
+      : page === 2
+        ? [{ id: 'last-order', status: 'done', event: 'last-event', done_at: now, values: { full: 50 }, tickets: [] }]
+        : [];
     return new Response(JSON.stringify({
       data: rows,
-      pagination: { page, page_size: 200, total: 201 },
       refs: { events: { 'last-event': { title: 'Финальное событие' } } }
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
 
   try {
     const result = await ticketscloudService.getStats(' organizer-key ', 'week');
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 3);
     assert.equal(requests[0].url.pathname, '/v2/resources/orders');
     assert.equal(requests[0].url.searchParams.get('page_size'), '200');
     assert.ok(requests[0].url.searchParams.has('created_at'));
     assert.equal(requests[0].authorization, 'key organizer-key');
-    assert.match(result.text, /20\s050,00 ₽/);
+    assert.match(result.text, /2\s050,00 ₽/);
     assert.doesNotMatch(result.text, /Комиссия|Доход к выплате/);
   } finally {
     globalThis.fetch = originalFetch;

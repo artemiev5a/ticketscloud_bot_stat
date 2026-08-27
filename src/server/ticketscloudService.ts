@@ -92,7 +92,9 @@ function zonedMidnightUtc(date: Date, daysBack: number): Date {
 }
 
 export function periodRange(period: StatsPeriod, now = new Date()): { from: Date; to: Date } {
-  return { from: zonedMidnightUtc(now, period === 'week' ? 6 : 0), to: now };
+  // Кабинет TicketsCloud для «Недели» показывает интервал от полуночи
+  // семь суток назад до текущего момента (на экране видны обе граничные даты).
+  return { from: zonedMidnightUtc(now, period === 'week' ? 7 : 0), to: now };
 }
 
 function titleText(value: LocalizedTitle | undefined): string | undefined {
@@ -160,6 +162,7 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   const orders: Order[] = [];
   const refs: NonNullable<OrdersResponse['refs']> = { events: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
+  const seenOrders = new Set<string>();
   let page = 1;
 
   while (page <= MAX_PAGES) {
@@ -176,11 +179,20 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
     if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
 
     const rows = Array.isArray(body.data) ? body.data : [];
-    orders.push(...rows);
     Object.assign(refs.events!, body.refs?.events || {});
-    const totalPages = body.pagination?.pages
-      || (body.pagination?.total ? Math.ceil(body.pagination.total / (body.pagination.page_size || PAGE_SIZE)) : undefined);
-    if (!(totalPages !== undefined ? page < totalPages : rows.length === PAGE_SIZE)) break;
+
+    let addedOnPage = 0;
+    for (const order of rows) {
+      // Не полагаемся на неодинаковые варианты `pagination` в Orders API:
+      // запрашиваем следующую страницу до пустого ответа. Защита от повторов
+      // останавливает цикл, даже если API проигнорирует параметр `page`.
+      const identity = order.id || JSON.stringify(order);
+      if (seenOrders.has(identity)) continue;
+      seenOrders.add(identity);
+      orders.push(order);
+      addedOnPage += 1;
+    }
+    if (rows.length === 0 || addedOnPage === 0) break;
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц заказов');
