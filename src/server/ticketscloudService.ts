@@ -14,6 +14,7 @@ type Order = {
   id?: string;
   status?: string;
   event?: string;
+  meta_event?: string;
   created_at?: string;
   done_at?: string;
   tickets?: Ticket[];
@@ -28,13 +29,16 @@ type Order = {
 type OrdersResponse = {
   data?: Order[];
   pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
-  refs?: { events?: Record<string, { title?: LocalizedTitle; name?: string }> };
+  refs?: {
+    events?: Record<string, { title?: LocalizedTitle; name?: string; meta_event?: string }>;
+    meta_events?: Record<string, { title?: LocalizedTitle; name?: string }>;
+  };
   reason?: string;
   message?: string;
   errors?: string[];
 };
 
-type EventStats = { orders: number; tickets: number; sales: number };
+type EventStats = { title: string; orders: number; tickets: number; sales: number };
 type BotStatsResponse = {
   text: string;
   reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
@@ -101,15 +105,20 @@ function titleText(value: LocalizedTitle | undefined): string | undefined {
   return typeof value === 'string' ? value : value?.text;
 }
 
-function eventTitle(order: Order, refs: OrdersResponse['refs']): string {
-  const ref = order.event ? refs?.events?.[order.event] : undefined;
-  return titleText(ref?.title) || ref?.name || (order.event ? `Мероприятие ${order.event}` : 'Мероприятие без названия');
+function eventIdentity(order: Order, refs: OrdersResponse['refs']): { key: string; title: string } {
+  const eventRef = order.event ? refs?.events?.[order.event] : undefined;
+  const metaEventId = order.meta_event || eventRef?.meta_event;
+  const metaEventRef = metaEventId ? refs?.meta_events?.[metaEventId] : undefined;
+  const title = titleText(metaEventRef?.title) || metaEventRef?.name
+    || titleText(eventRef?.title) || eventRef?.name
+    || (metaEventId ? `Мероприятие ${metaEventId}` : order.event ? `Мероприятие ${order.event}` : 'Мероприятие без названия');
+  return { key: metaEventId || order.event || title, title };
 }
 
 function orderSales(order: Order): number {
-  // `values.full` соответствует колонке «Продажи» в кабинете. Остальные
-  // поля нужны лишь для обратной совместимости со старыми ответами API.
-  return asNumber(order.values?.full ?? order.values?.price ?? order.values?.nominal);
+  // В Orders API `full = price + extra`. Кабинет показывает `price` в
+  // колонке «Продажи», а `extra` не является его колонкой «Сервисный сбор».
+  return asNumber(order.values?.price ?? order.values?.nominal ?? order.values?.full);
 }
 
 function ticketRefund(ticket: Ticket): number {
@@ -118,7 +127,6 @@ function ticketRefund(ticket: Ticket): number {
 
 export function aggregateOrders(orders: Order[], refs?: OrdersResponse['refs']) {
   let sales = 0;
-  let serviceFees = 0;
   let successfulOrders = 0;
   let ticketsSold = 0;
   let refunds = 0;
@@ -128,20 +136,29 @@ export function aggregateOrders(orders: Order[], refs?: OrdersResponse['refs']) 
   for (const order of orders) {
     const status = order.status?.toLowerCase() || '';
     const tickets = Array.isArray(order.tickets) ? order.tickets : [];
+    const isSuccessful = SUCCESSFUL_ORDER_STATUSES.has(status);
+    const isFullyRefunded = REFUNDED_ORDER_STATUSES.has(status);
 
-    if (SUCCESSFUL_ORDER_STATUSES.has(status)) {
+    if (isSuccessful) {
       const amount = orderSales(order);
       successfulOrders += 1;
       sales += amount;
-      serviceFees += asNumber(order.values?.extra);
       ticketsSold += tickets.length;
 
-      const title = eventTitle(order, refs);
-      const event = events.get(title) || { orders: 0, tickets: 0, sales: 0 };
+      const identity = eventIdentity(order, refs);
+      const event = events.get(identity.key) || { title: identity.title, orders: 0, tickets: 0, sales: 0 };
       event.orders += 1;
       event.tickets += tickets.length;
       event.sales += amount;
-      events.set(title, event);
+      events.set(identity.key, event);
+    } else if (isFullyRefunded) {
+      // Кабинет не считает такой заказ успешным, но сохраняет исходно
+      // проданные билеты в счётчике «Продажи → билеты».
+      ticketsSold += tickets.length;
+      const identity = eventIdentity(order, refs);
+      const event = events.get(identity.key) || { title: identity.title, orders: 0, tickets: 0, sales: 0 };
+      event.tickets += tickets.length;
+      events.set(identity.key, event);
     }
 
     const refundedTickets = tickets.filter(ticket => REFUNDED_TICKET_STATUSES.has(ticket.status?.toLowerCase() || ''));
@@ -155,12 +172,12 @@ export function aggregateOrders(orders: Order[], refs?: OrdersResponse['refs']) 
     }
   }
 
-  return { sales, serviceFees, successfulOrders, ticketsSold, refunds, ticketsRefunded, events };
+  return { sales, successfulOrders, ticketsSold, refunds, ticketsRefunded, events };
 }
 
 async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orders: Order[]; refs: NonNullable<OrdersResponse['refs']> }> {
   const orders: Order[] = [];
-  const refs: NonNullable<OrdersResponse['refs']> = { events: {} };
+  const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
   const seenOrders = new Set<string>();
   let page = 1;
@@ -180,6 +197,7 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
 
     const rows = Array.isArray(body.data) ? body.data : [];
     Object.assign(refs.events!, body.refs?.events || {});
+    Object.assign(refs.meta_events!, body.refs?.meta_events || {});
 
     let addedOnPage = 0;
     for (const order of rows) {
@@ -240,12 +258,11 @@ export const ticketscloudService = {
     const eventLines = [...stats.events.entries()]
       .sort((a, b) => b[1].sales - a[1].sales)
       .slice(0, 10)
-      .map(([title, event]) => `🔹 <b>${escapeHtml(title)}</b>\n   • Продажи: <b>${money(event.sales)} ₽</b>\n   • Заказов: <b>${event.orders}</b> · Билетов: <b>${event.tickets}</b>`);
+      .map(([, event]) => `🔹 <b>${escapeHtml(event.title)}</b>\n   • Продажи: <b>${money(event.sales)} ₽</b>\n   • Заказов: <b>${event.orders}</b> · Билетов: <b>${event.tickets}</b>`);
 
     let totals = `💳 Продажи: <b>${money(stats.sales)} ₽</b>\n`
       + `🛒 Успешных заказов: <b>${stats.successfulOrders}</b>\n`
       + `🎟 Билетов: <b>${stats.ticketsSold}</b>`;
-    if (stats.serviceFees !== 0) totals += `\n🧾 Сервисный сбор: <b>${money(stats.serviceFees)} ₽</b>`;
     if (stats.refunds !== 0) totals += `\n↩️ Возвраты: <b>- ${money(stats.refunds)} ₽</b> (${stats.ticketsRefunded} бил.)`;
 
     const data: BotStatsResponse = {

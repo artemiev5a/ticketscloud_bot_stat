@@ -8,33 +8,38 @@ test('matches the dashboard week boundaries in Moscow time', () => {
   assert.equal(range.to.toISOString(), '2026-08-27T07:27:00.000Z');
 });
 
-test('uses full sales value and separates successful orders from refunds', () => {
+test('matches dashboard sales, ticket count and distinct same-title events', () => {
+  const successful = Array.from({ length: 82 }, (_, index) => ({
+    id: `done-${index}`,
+    status: 'done',
+    event: index === 81 ? 'event-b' : 'event-a',
+    values: index === 0
+      ? { full: 406585.9, price: 382669, extra: 23916.9 }
+      : { full: 0, price: 0, extra: 0 },
+    tickets: index === 0 ? Array.from({ length: 175 }, () => ({ status: 'done', price: 1000 })) : []
+  }));
   const stats = aggregateOrders([
-    {
-      status: 'done', event: 'event-a', values: { full: 659600, price: 644100, extra: 62210 },
-      tickets: Array.from({ length: 207 }, () => ({ status: 'done', full: 1000 }))
+    ...successful,
+    { id: 'refunded-1', status: 'refunded', event: 'event-b', values: { price: 0 }, tickets: [{ status: 'refunded', price: 14998 }] }
+  ], {
+    events: {
+      'event-a': { title: 'Одинаковое название', meta_event: 'meta-a' },
+      'event-b': { title: 'Одинаковое название', meta_event: 'meta-b' }
     },
-    {
-      status: 'partially_refunded', event: 'event-a', values: { full: 0 },
-      tickets: [
-        { status: 'refunded', full: 6000 },
-        { status: 'returned', full: 6000 },
-        { status: 'canceled', full: 6000 }
-      ]
-    },
-    {
-      status: 'refunded', event: 'event-a', values: { full: 15500 },
-      tickets: []
+    meta_events: {
+      'meta-a': { title: 'Одинаковое название' },
+      'meta-b': { title: 'Одинаковое название' }
     }
-  ], { events: { 'event-a': { title: 'LUMEN' } } });
+  });
 
-  assert.equal(stats.sales, 659600);
-  assert.equal(stats.serviceFees, 62210);
-  assert.equal(stats.successfulOrders, 2);
-  assert.equal(stats.ticketsSold, 210);
-  assert.equal(stats.refunds, 33500);
-  assert.equal(stats.ticketsRefunded, 3);
-  assert.equal(stats.events.get('LUMEN')?.sales, 659600);
+  assert.equal(stats.sales, 382669);
+  assert.equal(stats.successfulOrders, 82);
+  assert.equal(stats.ticketsSold, 176);
+  assert.equal(stats.refunds, 14998);
+  assert.equal(stats.ticketsRefunded, 1);
+  assert.equal(stats.events.size, 2);
+  assert.equal(stats.events.get('meta-a')?.title, 'Одинаковое название');
+  assert.equal(stats.events.get('meta-b')?.title, 'Одинаковое название');
 });
 
 test('uses orders endpoint, key authentication and every page', async () => {
@@ -69,7 +74,8 @@ test('uses orders endpoint, key authentication and every page', async () => {
     assert.equal(requests[0].url.searchParams.get('page_size'), '200');
     assert.ok(requests[0].url.searchParams.has('created_at'));
     assert.equal(requests[0].authorization, 'key organizer-key');
-    assert.match(result.text, /2\s050,00 ₽/);
+    assert.match(result.text, /1\s850,00 ₽/);
+    assert.doesNotMatch(result.text, /Сервисный сбор/);
     assert.doesNotMatch(result.text, /Комиссия|Доход к выплате/);
   } finally {
     globalThis.fetch = originalFetch;
