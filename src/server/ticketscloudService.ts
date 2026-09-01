@@ -98,7 +98,7 @@ const CACHE_TODAY_TTL_MS = Math.max(30_000, Number(process.env.CACHE_TODAY_TTL_M
 const CACHE_WEEK_TTL_MS = Math.max(30_000, Number(process.env.CACHE_WEEK_TTL_MS) || 300_000);
 const CACHE_MAX_STALE_MS = Math.max(300_000, Number(process.env.CACHE_MAX_STALE_MS) || 1_800_000);
 const CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CACHE_MAX_ENTRIES) || 1_000);
-const CACHE_FORMULA_VERSION = 'orders-v4';
+const CACHE_FORMULA_VERSION = 'orders-v5-full-pagination';
 const CACHE_KEY_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
 const API_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.TICKETSCLOUD_REQUEST_TIMEOUT_MS) || 45_000);
 const API_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.TICKETSCLOUD_MAX_ATTEMPTS) || 2));
@@ -418,7 +418,6 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {}, venues: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
   const seenOrders = new Set<string>();
-  let expectedTotal: number | undefined;
   let page = 1;
 
   while (page <= MAX_PAGES) {
@@ -429,11 +428,8 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
     });
     const body = await fetchApiPage<OrdersResponse>(apiKey, ORDERS_PATH, query, 'Orders', page);
     if (!Array.isArray(body.data)) throw new Error('Orders API вернул ответ неизвестного формата');
-    if (Number.isFinite(body.pagination?.total)) {
-      const pageTotal = body.pagination!.total!;
-      if (expectedTotal === undefined) expectedTotal = pageTotal;
-      else if (pageTotal !== expectedTotal) throw new Error(`Orders API изменился во время загрузки: было ${expectedTotal}, стало ${pageTotal}`);
-    }
+    // pagination.total в живом API может означать размер текущего фрагмента,
+    // поэтому завершение доказывает только реально пустая следующая страница.
 
     const rows = body.data;
     Object.assign(refs.events!, body.refs?.events || {});
@@ -451,15 +447,11 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
       orders.push(order);
       addedOnPage += 1;
     }
-    if (expectedTotal !== undefined && orders.length >= expectedTotal) break;
     if (rows.length === 0) break;
     if (addedOnPage === 0) throw new Error(`Orders API повторил страницу ${page}; полный отчёт не сформирован`);
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц заказов');
-  if (expectedTotal !== undefined && orders.length < expectedTotal) {
-    throw new Error(`Orders API вернул не все страницы: ${orders.length} из ${expectedTotal}`);
-  }
   return { orders, refs };
 }
 
@@ -470,7 +462,6 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
   const refunds: RefundRequest[] = [];
   const ticketRefs: Record<string, Ticket> = {};
   const seen = new Set<string>();
-  let expectedTotal: number | undefined;
   let page = 1;
 
   while (page <= MAX_PAGES) {
@@ -482,11 +473,6 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
     });
     const body = await fetchApiPage<RefundsResponse>(apiKey, REFUNDS_PATH, query, 'Refunds', page);
     if (!Array.isArray(body.data)) throw new Error('Refunds API вернул ответ неизвестного формата');
-    if (Number.isFinite(body.pagination?.total)) {
-      const pageTotal = body.pagination!.total!;
-      if (expectedTotal === undefined) expectedTotal = pageTotal;
-      else if (pageTotal !== expectedTotal) throw new Error(`Refunds API изменился во время загрузки: было ${expectedTotal}, стало ${pageTotal}`);
-    }
 
     const rows = body.data;
     Object.assign(ticketRefs, body.refs?.tickets || {});
@@ -498,15 +484,11 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
       refunds.push(refund);
       addedOnPage += 1;
     }
-    if (expectedTotal !== undefined && refunds.length >= expectedTotal) break;
     if (rows.length === 0) break;
     if (addedOnPage === 0) throw new Error(`Refunds API повторил страницу ${page}; полный отчёт не сформирован`);
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц возвратов');
-  if (expectedTotal !== undefined && refunds.length < expectedTotal) {
-    throw new Error(`Refunds API вернул не все страницы: ${refunds.length} из ${expectedTotal}`);
-  }
   return { refunds, ticketRefs };
 }
 

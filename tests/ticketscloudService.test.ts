@@ -292,7 +292,7 @@ test('retries a timed out Orders page and identifies the resource', async () => 
   }
 });
 
-test('stops pagination as soon as the reported total is loaded', async () => {
+test('does not stop on an unreliable page-local pagination total', async () => {
   const originalFetch = globalThis.fetch;
   let orderRequests = 0;
   globalThis.fetch = (async (input: string | URL | Request) => {
@@ -303,17 +303,22 @@ test('stops pagination as soon as the reported total is loaded', async () => {
       });
     }
     orderRequests += 1;
+    const page = Number(url.searchParams.get('page'));
     const now = new Date(Date.now() - 60_000).toISOString();
+    const rows = page <= 2
+      ? [{ id: `order-page-${page}`, status: 'done', done_at: now, values: { nominal: 100 }, tickets: [] }]
+      : [];
     return new Response(JSON.stringify({
-      data: [{ id: 'only-order', status: 'done', done_at: now, values: { nominal: 100 }, tickets: [] }],
+      data: rows,
+      // Ticketscloud может сообщить размер фрагмента вместо общего total.
       pagination: { total: 1 }
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
 
   try {
     const result = await ticketscloudService.getStats('known-total-key', 'today', true);
-    assert.equal(orderRequests, 1);
-    assert.match(result.text, /100,00 ₽/);
+    assert.equal(orderRequests, 3);
+    assert.match(result.text, /200,00 ₽/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -334,8 +339,11 @@ test('loads all 668 live-style orders without the broken server-side status filt
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = new URL(input.toString());
     if (url.pathname === '/v2/resources/refund_requests') {
+      const refundPage = Number(url.searchParams.get('page'));
       return new Response(JSON.stringify({
-        data: [{ id: 'large-refund', status: 'approved', refund_nominal: 2_500, tickets: ['refund-ticket'] }],
+        data: refundPage === 1
+          ? [{ id: 'large-refund', status: 'approved', refund_nominal: 2_500, tickets: ['refund-ticket'] }]
+          : [],
         refs: { tickets: {} },
         pagination: { total: 1 }
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -348,16 +356,18 @@ test('loads all 668 live-style orders without the broken server-side status filt
     const hasBrokenFilter = url.searchParams.has('status');
     const rows = hasBrokenFilter
       ? orders.slice(0, 200)
-      : orders.slice((page - 1) * 200, page * 200);
+      // Живой API запросил 200, но фактически отдавал короткие фрагменты
+      // и на каждой странице сообщал page-local total=64.
+      : orders.slice((page - 1) * 64, page * 64);
     return new Response(JSON.stringify({
       data: rows,
-      pagination: { total: hasBrokenFilter ? 200 : 668 }
+      pagination: { total: hasBrokenFilter ? 200 : 64 }
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
 
   try {
     const result = await ticketscloudService.getStats('live-668-key', 'today', true);
-    assert.deepEqual(orderPages, [1, 2, 3, 4]);
+    assert.deepEqual(orderPages, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     assert.match(result.text, /66\s800,00 ₽/);
     assert.match(result.text, /Успешных заказов: <b>668<\/b>/);
     assert.match(result.text, /Билетов: <b>668<\/b>/);
@@ -387,8 +397,11 @@ test('serves only aggregate cache with timestamp and falls back after refresh fa
       });
     }
     orderRequests += 1;
+    const page = Number(url.searchParams.get('page'));
     return new Response(JSON.stringify({
-      data: [{ id: 'cache-order', status: 'done', done_at: now, values: { nominal: 123 }, tickets: [] }],
+      data: page === 1
+        ? [{ id: 'cache-order', status: 'done', done_at: now, values: { nominal: 123 }, tickets: [] }]
+        : [],
       pagination: { total: 1 }
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
@@ -397,12 +410,12 @@ test('serves only aggregate cache with timestamp and falls back after refresh fa
     const first = await ticketscloudService.getStats('aggregate-cache-secret', 'today', true);
     assert.match(first.text, /123,00 ₽/);
     assert.match(first.text, /Проверено:/);
-    assert.equal(orderRequests, 1);
+    assert.equal(orderRequests, 2);
     assert.equal(refundRequests, 1);
 
     const second = await ticketscloudService.getStats('aggregate-cache-secret', 'today');
     assert.match(second.text, /123,00 ₽/);
-    assert.equal(orderRequests, 1, 'fresh aggregate cache must avoid Orders API');
+    assert.equal(orderRequests, 2, 'fresh aggregate cache must avoid Orders API');
     assert.equal(refundRequests, 1, 'fresh aggregate cache must avoid Refunds API');
 
     const current = ticketscloudService.getCachedStats('aggregate-cache-secret', 'today');
