@@ -10,6 +10,7 @@ type Ticket = {
   full?: Money;
   price?: Money;
   nominal?: Money;
+  restoredFromRefund?: boolean;
 };
 
 type Order = {
@@ -163,12 +164,11 @@ function localizedName(value?: LocalizedName): string {
 
 function eventStart(value?: string, timeZone?: string): string {
   if (!value) return '';
-  // В Orders API локальное время обычно приходит без UTC-смещения.
-  const local = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  // В отличие от done_at, lifetime.start приходит как UTC даже без суффикса.
+  // Это подтверждено живым payload: 12:00 -> 19:00 в Новосибирске.
   const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
-  if (local && !hasOffset) return `${local[3]}.${local[2]}.${local[1]}, ${local[4]}:${local[5]}`;
-
-  const date = new Date(value);
+  const normalized = hasOffset ? value : `${value.replace(' ', 'T')}Z`;
+  const date = new Date(normalized);
   if (Number.isNaN(date.valueOf())) return '';
   return new Intl.DateTimeFormat('ru-RU', {
     timeZone: timeZone || REPORT_TIME_ZONE,
@@ -201,10 +201,14 @@ function orderSales(order: Order): number {
   // оплаченная стоимость билета, а `full = nominal + extra`. Кабинет в
   // колонке «Продажи» суммирует nominal и не включает extra.
   const tickets = Array.isArray(order.tickets) ? order.tickets : [];
-  if (tickets.length > 0 && tickets.every(ticket => ticket.nominal !== undefined || ticket.price !== undefined)) {
+  // После возврата Orders API может убрать билет и уменьшить values.nominal.
+  // Восстановленный из refund refs билет нужен для исходного gross turnover.
+  if (tickets.some(ticket => ticket.restoredFromRefund)) {
     return tickets.reduce((sum, ticket) => sum + asNumber(ticket.nominal ?? ticket.price), 0);
   }
-  return asNumber(order.values?.nominal ?? order.values?.price ?? order.values?.full);
+  if (order.values?.nominal !== undefined) return asNumber(order.values.nominal);
+  if (tickets.length > 0) return tickets.reduce((sum, ticket) => sum + asNumber(ticket.nominal ?? ticket.price), 0);
+  return asNumber(order.values?.price ?? order.values?.full);
 }
 
 function isCompletedSale(order: Order): boolean {
@@ -212,6 +216,14 @@ function isCompletedSale(order: Order): boolean {
   // сохраниться у отменённого/откаченного заказа, поэтому одной даты мало.
   if (order.status?.toLowerCase() !== 'done') return false;
   return Boolean(parseApiDate(order.done_at));
+}
+
+export function selectOrdersForRange(orders: Order[], from: Date, to: Date): Order[] {
+  return orders.filter(order => {
+    if (!isCompletedSale(order)) return false;
+    const completedAt = parseApiDate(order.done_at);
+    return Boolean(completedAt && completedAt >= from && completedAt <= to);
+  });
 }
 
 function restoreRefundedTickets(
@@ -229,7 +241,7 @@ function restoreRefundedTickets(
       if (present.has(ticketId)) continue;
       const ticket = refundTicketRefs?.[ticketId];
       if (!ticket) throw new Error(`API не вернул данные возвращённого билета ${ticketId}`);
-      tickets.push({ ...ticket, id: ticket.id || ticketId });
+      tickets.push({ ...ticket, id: ticket.id || ticketId, restoredFromRefund: true });
       present.add(ticketId);
     }
     order.tickets = tickets;
@@ -243,12 +255,15 @@ export function aggregateOrders(
   refunds: RefundRequest[] = [],
   refundTicketRefs?: Record<string, Ticket>
 ) {
-  restoreRefundedTickets(orders, refunds, refundTicketRefs);
+  const approvedRefunds = refunds.filter(refund => !refund.status || refund.status.toLowerCase() === 'approved');
+  restoreRefundedTickets(orders, approvedRefunds, refundTicketRefs);
   let sales = 0;
   let successfulOrders = 0;
   let ticketsSold = 0;
-  const refundAmount = refunds.reduce((sum, refund) => sum + asNumber(refund.refund_nominal ?? refund.delta), 0);
-  const refundedTicketIds = new Set(refunds.flatMap(refund => refund.tickets || []));
+  const refundAmount = approvedRefunds.reduce(
+    (sum, refund) => sum + Math.abs(asNumber(refund.refund_nominal ?? refund.delta)), 0
+  );
+  const refundedTicketIds = new Set(approvedRefunds.flatMap(refund => refund.tickets || []));
   const events = new Map<string, EventStats>();
 
   for (const order of orders) {
@@ -283,6 +298,7 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {}, venues: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
   const seenOrders = new Set<string>();
+  let expectedTotal: number | undefined;
   let page = 1;
 
   while (page <= MAX_PAGES) {
@@ -297,8 +313,10 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
     });
     const body = await response.json().catch(() => ({})) as OrdersResponse;
     if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+    if (!Array.isArray(body.data)) throw new Error('Orders API вернул ответ неизвестного формата');
+    if (Number.isFinite(body.pagination?.total)) expectedTotal = body.pagination!.total;
 
-    const rows = Array.isArray(body.data) ? body.data : [];
+    const rows = body.data;
     Object.assign(refs.events!, body.refs?.events || {});
     Object.assign(refs.meta_events!, body.refs?.meta_events || {});
     Object.assign(refs.venues!, body.refs?.venues || {});
@@ -318,6 +336,9 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц заказов');
+  if (expectedTotal !== undefined && orders.length < expectedTotal) {
+    throw new Error(`Orders API вернул не все страницы: ${orders.length} из ${expectedTotal}`);
+  }
   return { orders, refs };
 }
 
@@ -328,6 +349,7 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
   const refunds: RefundRequest[] = [];
   const ticketRefs: Record<string, Ticket> = {};
   const seen = new Set<string>();
+  let expectedTotal: number | undefined;
   let page = 1;
 
   while (page <= MAX_PAGES) {
@@ -343,8 +365,10 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
     });
     const body = await response.json().catch(() => ({})) as RefundsResponse;
     if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+    if (!Array.isArray(body.data)) throw new Error('Refunds API вернул ответ неизвестного формата');
+    if (Number.isFinite(body.pagination?.total)) expectedTotal = body.pagination!.total;
 
-    const rows = Array.isArray(body.data) ? body.data : [];
+    const rows = body.data;
     Object.assign(ticketRefs, body.refs?.tickets || {});
     let addedOnPage = 0;
     for (const refund of rows) {
@@ -358,6 +382,9 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц возвратов');
+  if (expectedTotal !== undefined && refunds.length < expectedTotal) {
+    throw new Error(`Refunds API вернул не все страницы: ${refunds.length} из ${expectedTotal}`);
+  }
   return { refunds, ticketRefs };
 }
 
@@ -370,7 +397,7 @@ function periodTitle(period: StatsPeriod, from: Date, to: Date): string {
 }
 
 export const ticketscloudService = {
-  async getStats(apiKey?: string, period: StatsPeriod = 'today'): Promise<BotStatsResponse> {
+  async getStats(apiKey?: string, period: StatsPeriod = 'today', forceRefresh = false): Promise<BotStatsResponse> {
     const normalizedKey = apiKey?.trim();
     if (!normalizedKey) return {
       text: '⚠️ <b>API-ключ не указан!</b>',
@@ -380,7 +407,7 @@ export const ticketscloudService = {
     const { from, to } = periodRange(period);
     const cacheKey = `${normalizedKey}_${period}_${from.toISOString().slice(0, 13)}`;
     const cached = cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return { ...cached.data, text: `${cached.data.text}\n\n<i>⚡ Данные из кэша (30 сек)</i>` };
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.data, text: `${cached.data.text}\n\n<i>⚡ Данные из кэша (30 сек)</i>` };
 
     let fetched: Awaited<ReturnType<typeof fetchOrders>>;
     let fetchedRefunds: Awaited<ReturnType<typeof fetchRefunds>>;
@@ -396,15 +423,18 @@ export const ticketscloudService = {
       };
     }
 
-    const selected = fetched.orders.filter(order => {
-      const completedAt = parseApiDate(order.done_at);
-      return Boolean(completedAt && completedAt >= from && completedAt <= to);
-    });
+    const selected = selectOrdersForRange(fetched.orders, from, to);
     const stats = aggregateOrders(selected, fetched.refs, fetchedRefunds.refunds, fetchedRefunds.ticketRefs);
-    const eventLines = [...stats.events.entries()]
-      .sort((a, b) => b[1].sales - a[1].sales)
-      .slice(0, 10)
+    const sortedEvents = [...stats.events.entries()].sort((a, b) => b[1].sales - a[1].sales);
+    const eventLines = sortedEvents.slice(0, 10)
       .map(([, event]) => `🔹 <b>${escapeHtml(event.title)}</b>\n   • Продажи: <b>${money(event.sales)} ₽</b>\n   • Заказов: <b>${event.orders}</b> · Билетов: <b>${event.tickets}</b>`);
+    const hiddenEvents = sortedEvents.slice(10).map(([, event]) => event);
+    if (hiddenEvents.length) {
+      eventLines.push(`▫️ <b>Другие события: ${hiddenEvents.length}</b>\n`
+        + `   • Продажи: <b>${money(hiddenEvents.reduce((sum, event) => sum + event.sales, 0))} ₽</b>\n`
+        + `   • Заказов: <b>${hiddenEvents.reduce((sum, event) => sum + event.orders, 0)}</b>`
+        + ` · Билетов: <b>${hiddenEvents.reduce((sum, event) => sum + event.tickets, 0)}</b>`);
+    }
 
     let totals = `💳 Продажи: <b>${money(stats.sales)} ₽</b>\n`
       + `🛒 Успешных заказов: <b>${stats.successfulOrders}</b>\n`
@@ -417,7 +447,7 @@ export const ticketscloudService = {
       reply_markup: { inline_keyboard: [
         [{ text: period === 'today' ? '✅ Сегодня' : '📊 Сегодня', callback_data: 'stats_today' },
           { text: period === 'week' ? '✅ 7 дней' : '📅 7 дней', callback_data: 'stats_week' }],
-        [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]
+        [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'refresh_stats_week' : 'refresh_stats_today' }]
       ] }
     };
     cache.set(cacheKey, { data, expiresAt: Date.now() + CACHE_TTL_MS });

@@ -219,8 +219,10 @@ class TelegramBotEngine {
 
     try { if (this.config.token) await telegramApi.answerCallbackQuery(this.config.token, cb.id); } catch (e) {}
 
-    if (data === 'stats_today' || data === 'btn_stats' || data === 'refresh_stats') { await this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
+    if (data === 'stats_today' || data === 'btn_stats') { await this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
     if (data === 'stats_week') { await this.sendTicketscloudStats(chatId, user.id, 'week'); return; }
+    if (data === 'refresh_stats' || data === 'refresh_stats_today') { await this.sendTicketscloudStats(chatId, user.id, 'today', true); return; }
+    if (data === 'refresh_stats_week') { await this.sendTicketscloudStats(chatId, user.id, 'week', true); return; }
 
     if (data === 'prompt_set_key') {
       this.awaitingKeyUsers.add(user.id);
@@ -234,7 +236,7 @@ class TelegramBotEngine {
     }
   }
 
-  public async sendTicketscloudStats(chatId: number, userId: number = chatId, period: StatsPeriod = 'today') {
+  public async sendTicketscloudStats(chatId: number, userId: number = chatId, period: StatsPeriod = 'today', forceRefresh = false) {
     const encryptedKey = this.userApiKeys.get(userId) || '';
     try { if (this.config.token) await telegramApi.sendChatAction(this.config.token, chatId, 'typing'); } catch (e) {}
 
@@ -250,7 +252,7 @@ class TelegramBotEngine {
       }
     }
     
-    const res = await ticketscloudService.getStats(realApiKey, period);
+    const res = await ticketscloudService.getStats(realApiKey, period, forceRefresh);
     await this.sendBotReply(chatId, res.text, res.reply_markup?.inline_keyboard);
   }
 

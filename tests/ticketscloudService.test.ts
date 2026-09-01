@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregateOrders, parseApiDate, periodRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
+import { aggregateOrders, parseApiDate, periodRange, selectOrdersForRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
 
 test('matches the dashboard week boundaries in Moscow time', () => {
   const range = periodRange('week', new Date('2026-08-27T07:27:00Z'));
@@ -11,6 +11,37 @@ test('matches the dashboard week boundaries in Moscow time', () => {
 test('parses timezone-less API completion dates as Moscow time', () => {
   assert.equal(parseApiDate('2026-08-31 22:30:00')?.toISOString(), '2026-08-31T19:30:00.000Z');
   assert.equal(parseApiDate('2026-09-01T00:30:00Z')?.toISOString(), '2026-09-01T00:30:00.000Z');
+});
+
+test('matches the live MNR dashboard by excluding pre-period local timestamps', () => {
+  const makeOrders = (count: number, ticketCount: number, sales: number, done_at: string, prefix: string) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `${prefix}-${index}`,
+      status: 'done',
+      done_at,
+      event: 'lumen',
+      values: { nominal: index === 0 ? sales : 0 },
+      tickets: index === 0
+        ? Array.from({ length: ticketCount }, (_, ticketIndex) => ({
+            id: `${prefix}-ticket-${ticketIndex}`,
+            nominal: ticketIndex === 0 ? sales : 0
+          }))
+        : []
+    }));
+  const apiOrders = [
+    ...makeOrders(144, 222, 700_800, '2026-08-25 10:00:00', 'dashboard'),
+    ...makeOrders(2, 5, 14_000, '2026-08-24 23:00:00', 'before-period')
+  ];
+  const selected = selectOrdersForRange(
+    apiOrders,
+    new Date('2026-08-24T21:00:00Z'),
+    new Date('2026-09-01T13:56:54Z')
+  );
+  const stats = aggregateOrders(selected);
+
+  assert.equal(stats.sales, 700_800);
+  assert.equal(stats.successfulOrders, 144);
+  assert.equal(stats.ticketsSold, 222);
 });
 
 test('matches Matyukhina dashboard with discounts and restored refunded tickets', () => {
@@ -116,6 +147,22 @@ test('does not count an order that has done_at but is no longer done', () => {
   assert.equal(stats.ticketsSold, 0);
 });
 
+test('uses authoritative order nominal and ignores non-approved refunds', () => {
+  const stats = aggregateOrders([{
+    id: 'discounted-order', status: 'done', done_at: '2026-09-01 12:00:00', event: 'event-1',
+    values: { nominal: 900, price: 1_000, full: 1_100 },
+    tickets: [{ id: 't1', nominal: 500 }, { id: 't2', nominal: 500 }]
+  }], undefined, [
+    { id: 'approved', status: 'approved', refund_nominal: 100, tickets: ['t1'] },
+    { id: 'pending', status: 'in_progress', refund_nominal: 900, tickets: ['t2'] },
+    { id: 'legacy-negative', status: 'approved', delta: -50, tickets: [] }
+  ]);
+
+  assert.equal(stats.sales, 900);
+  assert.equal(stats.refunds, 150);
+  assert.equal(stats.ticketsRefunded, 1);
+});
+
 test('distinguishes sessions with the same title by date, time and city', () => {
   const orders = [
     { id: 'order-1', status: 'done', done_at: '2026-09-01T10:00:00Z', event: 'lumen-nsk', tickets: [{ nominal: 1_000 }] },
@@ -123,8 +170,8 @@ test('distinguishes sessions with the same title by date, time and city', () => 
   ];
   const refs = {
     events: {
-      'lumen-nsk': { title: { text: 'LUMEN' }, lifetime: { start: '2026-10-18T12:00:00Z' }, timezone: 'UTC', venue: 'venue-nsk' },
-      'lumen-kzn': { title: { text: 'LUMEN' }, lifetime: { start: '2026-11-09 20:00:00' }, venue: 'venue-kzn' }
+      'lumen-nsk': { title: { text: 'LUMEN' }, lifetime: { start: '2026-10-18 12:00:00' }, timezone: 'UTC', venue: 'venue-nsk' },
+      'lumen-kzn': { title: { text: 'LUMEN' }, lifetime: { start: '2026-11-09 17:00:00' }, venue: 'venue-kzn' }
     },
     venues: {
       'venue-nsk': { city: { name: { ru: 'Новосибирск' }, timezone: 'Asia/Novosibirsk' } },
@@ -183,6 +230,29 @@ test('uses orders endpoint, key authentication and every page', async () => {
     assert.match(result.text, /1\s850,00 ₽/);
     assert.doesNotMatch(result.text, /Сервисный сбор/);
     assert.doesNotMatch(result.text, /Комиссия|Доход к выплате/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('reports incomplete pagination instead of silently showing wrong totals', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [], pagination: { total: 0 } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    return new Response(JSON.stringify({
+      data: [{ id: 'same-order', status: 'done', done_at: '2026-09-01 12:00:00', tickets: [] }],
+      pagination: { total: 2 }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('incomplete-pagination-key', 'today', true);
+    assert.match(result.text, /не все страницы: 1 из 2/);
   } finally {
     globalThis.fetch = originalFetch;
   }
