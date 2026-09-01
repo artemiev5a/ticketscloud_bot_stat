@@ -75,6 +75,24 @@ test('matches Matyukhina dashboard with discounts and restored refunded tickets'
   assert.equal(stats.events.get('dolphin-meta-a')?.tickets, 31);
 });
 
+test('does not count an order without done_at even when its status is done', () => {
+  const stats = aggregateOrders([{
+    id: 'unfinished-order',
+    status: 'done',
+    created_at: '2026-09-01T10:00:00Z',
+    event: 'event-1',
+    values: { nominal: 14_000 },
+    tickets: Array.from({ length: 5 }, (_, index) => ({
+      id: `unfinished-ticket-${index}`,
+      nominal: index === 0 ? 14_000 : 0
+    }))
+  }]);
+
+  assert.equal(stats.sales, 0);
+  assert.equal(stats.successfulOrders, 0);
+  assert.equal(stats.ticketsSold, 0);
+});
+
 test('uses orders endpoint, key authentication and every page', async () => {
   const requests: Array<{ url: URL; authorization: string | null }> = [];
   const originalFetch = globalThis.fetch;

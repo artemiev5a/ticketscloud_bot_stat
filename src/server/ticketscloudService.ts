@@ -77,8 +77,6 @@ const CACHE_TTL_MS = 30_000;
 const REPORT_TIME_ZONE = process.env.REPORT_TIME_ZONE || 'Europe/Moscow';
 const ORDER_LOOKBACK_DAYS = Math.max(7, Number(process.env.ORDER_LOOKBACK_DAYS) || 90);
 const DAY_MS = 24 * 60 * 60 * 1_000;
-const SUCCESSFUL_ORDER_STATUSES = new Set(['done', 'partially_refunded']);
-const REFUNDED_ORDER_STATUSES = new Set(['refunded', 'returned']);
 const cache = new Map<string, { data: BotStatsResponse; expiresAt: number }>();
 
 function asNumber(value: unknown): number {
@@ -151,11 +149,11 @@ function orderSales(order: Order): number {
 }
 
 function isCompletedSale(order: Order): boolean {
-  // После возврата текущий статус заказа может измениться, но done_at
-  // сохраняет факт состоявшейся продажи. У отменённой до оплаты брони done_at нет.
-  return Boolean(order.done_at)
-    || SUCCESSFUL_ORDER_STATUSES.has(order.status?.toLowerCase() || '')
-    || REFUNDED_ORDER_STATUSES.has(order.status?.toLowerCase() || '');
+  // Аналитика TicketsCloud относит продажу к периоду только по done_at.
+  // Статус сам по себе недостаточен: API иногда возвращает `done` у заказа
+  // без даты завершения, и подстановка created_at завышает отчёт.
+  if (!order.done_at) return false;
+  return !Number.isNaN(new Date(order.done_at).valueOf());
 }
 
 function restoreRefundedTickets(
@@ -340,9 +338,8 @@ export const ticketscloudService = {
     }
 
     const selected = fetched.orders.filter(order => {
-      const value = order.done_at || order.created_at;
-      if (!value) return false;
-      const completedAt = new Date(value);
+      if (!order.done_at) return false;
+      const completedAt = new Date(order.done_at);
       return !Number.isNaN(completedAt.valueOf()) && completedAt >= from && completedAt <= to;
     });
     const stats = aggregateOrders(selected, fetched.refs, fetchedRefunds.refunds, fetchedRefunds.ticketRefs);
