@@ -70,9 +70,9 @@ test('matches Matyukhina dashboard with discounts and restored refunded tickets'
   assert.equal(stats.ticketsSold, 178);
   assert.equal(stats.refunds, 14_998);
   assert.equal(stats.ticketsRefunded, 4);
-  assert.equal(stats.events.get('annushka-meta-a')?.sales, 75_500);
-  assert.equal(stats.events.get('annushka-meta-b')?.sales, 42_000);
-  assert.equal(stats.events.get('dolphin-meta-a')?.tickets, 31);
+  assert.equal(stats.events.get('annushka-moscow')?.sales, 75_500);
+  assert.equal(stats.events.get('annushka-spb')?.sales, 42_000);
+  assert.equal(stats.events.get('dolphin-spb')?.tickets, 31);
 });
 
 test('does not count an order without done_at even when its status is done', () => {
@@ -91,6 +91,28 @@ test('does not count an order without done_at even when its status is done', () 
   assert.equal(stats.sales, 0);
   assert.equal(stats.successfulOrders, 0);
   assert.equal(stats.ticketsSold, 0);
+});
+
+test('distinguishes sessions with the same title by date, time and city', () => {
+  const orders = [
+    { id: 'order-1', status: 'done', done_at: '2026-09-01T10:00:00Z', event: 'lumen-nsk', tickets: [{ nominal: 1_000 }] },
+    { id: 'order-2', status: 'done', done_at: '2026-09-01T10:00:00Z', event: 'lumen-kzn', tickets: [{ nominal: 2_000 }] }
+  ];
+  const refs = {
+    events: {
+      'lumen-nsk': { title: { text: 'LUMEN' }, lifetime: { start: '2026-10-18 19:00:00' }, venue: 'venue-nsk' },
+      'lumen-kzn': { title: { text: 'LUMEN' }, lifetime: { start: '2026-11-09 20:00:00' }, venue: 'venue-kzn' }
+    },
+    venues: {
+      'venue-nsk': { city: { name: { ru: 'Новосибирск' } } },
+      'venue-kzn': { city: { name: { ru: 'Казань' } } }
+    }
+  };
+
+  const stats = aggregateOrders(orders, refs);
+  assert.equal(stats.events.size, 2);
+  assert.equal(stats.events.get('lumen-nsk')?.title, 'LUMEN — 18.10.2026, 19:00, Новосибирск');
+  assert.equal(stats.events.get('lumen-kzn')?.title, 'LUMEN — 09.11.2026, 20:00, Казань');
 });
 
 test('uses orders endpoint, key authentication and every page', async () => {

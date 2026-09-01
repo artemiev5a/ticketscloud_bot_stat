@@ -2,6 +2,7 @@ export type StatsPeriod = 'today' | 'week';
 
 type Money = string | number;
 type LocalizedTitle = string | { text?: string };
+type LocalizedName = string | { default?: string; ru?: string; en?: string };
 
 type Ticket = {
   id?: string;
@@ -31,8 +32,19 @@ type OrdersResponse = {
   data?: Order[];
   pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
   refs?: {
-    events?: Record<string, { title?: LocalizedTitle; name?: string; meta_event?: string }>;
+    events?: Record<string, {
+      title?: LocalizedTitle;
+      name?: string;
+      meta_event?: string;
+      lifetime?: { start?: string; finish?: string };
+      timezone?: string;
+      venue?: string;
+    }>;
     meta_events?: Record<string, { title?: LocalizedTitle; name?: string }>;
+    venues?: Record<string, {
+      name?: string;
+      city?: { name?: LocalizedName; timezone?: string };
+    }>;
   };
   reason?: string;
   message?: string;
@@ -127,14 +139,42 @@ function titleText(value: LocalizedTitle | undefined): string | undefined {
   return typeof value === 'string' ? value : value?.text;
 }
 
+function localizedName(value?: LocalizedName): string {
+  if (typeof value === 'string') return value;
+  return value?.ru || value?.default || value?.en || '';
+}
+
+function eventStart(value?: string, timeZone?: string): string {
+  if (!value) return '';
+  // В Orders API локальное время обычно приходит без UTC-смещения.
+  const local = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  if (local && !hasOffset) return `${local[3]}.${local[2]}.${local[1]}, ${local[4]}:${local[5]}`;
+
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return '';
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: timeZone || REPORT_TIME_ZONE,
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  }).format(date);
+}
+
 function eventIdentity(order: Order, refs: OrdersResponse['refs']): { key: string; title: string } {
   const eventRef = order.event ? refs?.events?.[order.event] : undefined;
   const metaEventId = order.meta_event || eventRef?.meta_event;
   const metaEventRef = metaEventId ? refs?.meta_events?.[metaEventId] : undefined;
-  const title = titleText(metaEventRef?.title) || metaEventRef?.name
+  const baseTitle = titleText(metaEventRef?.title) || metaEventRef?.name
     || titleText(eventRef?.title) || eventRef?.name
     || (metaEventId ? `Мероприятие ${metaEventId}` : order.event ? `Мероприятие ${order.event}` : 'Мероприятие без названия');
-  return { key: metaEventId || order.event || title, title };
+  const venue = eventRef?.venue ? refs?.venues?.[eventRef.venue] : undefined;
+  const start = eventStart(eventRef?.lifetime?.start, eventRef?.timezone || venue?.city?.timezone);
+  const city = localizedName(venue?.city?.name);
+  const details = [start, city].filter(Boolean).join(', ');
+  return {
+    key: order.event || metaEventId || baseTitle,
+    title: details ? `${baseTitle} — ${details}` : baseTitle
+  };
 }
 
 function orderSales(order: Order): number {
@@ -222,7 +262,7 @@ export function aggregateOrders(
 
 async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orders: Order[]; refs: NonNullable<OrdersResponse['refs']> }> {
   const orders: Order[] = [];
-  const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {} };
+  const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {}, venues: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
   const seenOrders = new Set<string>();
   let page = 1;
@@ -243,6 +283,7 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
     const rows = Array.isArray(body.data) ? body.data : [];
     Object.assign(refs.events!, body.refs?.events || {});
     Object.assign(refs.meta_events!, body.refs?.meta_events || {});
+    Object.assign(refs.venues!, body.refs?.venues || {});
 
     let addedOnPage = 0;
     for (const order of rows) {
