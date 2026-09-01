@@ -87,10 +87,76 @@ const REFUNDS_PATH = '/v2/resources/refund_requests';
 const PAGE_SIZE = 200;
 const MAX_PAGES = 1_000;
 const CACHE_TTL_MS = 30_000;
+const API_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.TICKETSCLOUD_REQUEST_TIMEOUT_MS) || 45_000);
+const API_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.TICKETSCLOUD_MAX_ATTEMPTS) || 2));
 const REPORT_TIME_ZONE = process.env.REPORT_TIME_ZONE || 'Europe/Moscow';
 const ORDER_LOOKBACK_DAYS = Math.max(7, Number(process.env.ORDER_LOOKBACK_DAYS) || 90);
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const cache = new Map<string, { data: BotStatsResponse; expiresAt: number }>();
+
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function retryAfterMs(response: Response, attempt: number): number {
+  const value = response.headers.get('retry-after');
+  if (value) {
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) return Math.min(10_000, Math.max(0, seconds * 1_000));
+    const at = Date.parse(value);
+    if (Number.isFinite(at)) return Math.min(10_000, Math.max(0, at - Date.now()));
+  }
+  return Math.min(5_000, 500 * 2 ** (attempt - 1));
+}
+
+async function fetchApiPage<T>(
+  apiKey: string,
+  path: string,
+  query: URLSearchParams,
+  resource: 'Orders' | 'Refunds',
+  page: number
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= API_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE_URL}${path}?${query}`, {
+        headers: { Authorization: `key ${apiKey}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS)
+      });
+      const body = await response.json().catch(() => ({})) as T & {
+        reason?: string;
+        message?: string;
+        errors?: string[];
+      };
+      if (response.ok) return body;
+
+      const message = body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`;
+      if (!isRetryableStatus(response.status) || attempt === API_MAX_ATTEMPTS) {
+        throw new Error(`${resource}, страница ${page}: ${message}`);
+      }
+      await wait(retryAfterMs(response, attempt));
+    } catch (error: any) {
+      lastError = error;
+      const isTimeout = error?.name === 'TimeoutError'
+        || /aborted due to timeout|timed?\s*out|timeout/i.test(String(error?.message || error));
+      // Ошибки HTTP уже содержат безопасный контекст и не должны повторно
+      // оборачиваться как сетевые.
+      if (String(error?.message || '').startsWith(`${resource}, страница`)) throw error;
+      if (!isTimeout || attempt === API_MAX_ATTEMPTS) {
+        if (isTimeout) {
+          throw new Error(`${resource}, страница ${page}: API не ответил за ${Math.round(API_REQUEST_TIMEOUT_MS / 1_000)} сек. после ${attempt} попыток`);
+        }
+        throw new Error(`${resource}, страница ${page}: ошибка соединения с API`);
+      }
+      await wait(retryAfterMs(new Response(null), attempt));
+    }
+  }
+  throw lastError;
+}
 
 function asNumber(value: unknown): number {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
@@ -304,17 +370,17 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   while (page <= MAX_PAGES) {
     const query = new URLSearchParams({
       created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
+      status: 'done',
       page_size: String(PAGE_SIZE),
       page: String(page)
     });
-    const response = await fetch(`${API_BASE_URL}${ORDERS_PATH}?${query}`, {
-      headers: { Authorization: `key ${apiKey}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(20_000)
-    });
-    const body = await response.json().catch(() => ({})) as OrdersResponse;
-    if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+    const body = await fetchApiPage<OrdersResponse>(apiKey, ORDERS_PATH, query, 'Orders', page);
     if (!Array.isArray(body.data)) throw new Error('Orders API вернул ответ неизвестного формата');
-    if (Number.isFinite(body.pagination?.total)) expectedTotal = body.pagination!.total;
+    if (Number.isFinite(body.pagination?.total)) {
+      const pageTotal = body.pagination!.total!;
+      if (expectedTotal === undefined) expectedTotal = pageTotal;
+      else if (pageTotal !== expectedTotal) throw new Error(`Orders API изменился во время загрузки: было ${expectedTotal}, стало ${pageTotal}`);
+    }
 
     const rows = body.data;
     Object.assign(refs.events!, body.refs?.events || {});
@@ -332,7 +398,9 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
       orders.push(order);
       addedOnPage += 1;
     }
-    if (rows.length === 0 || addedOnPage === 0) break;
+    if (expectedTotal !== undefined && orders.length >= expectedTotal) break;
+    if (rows.length === 0) break;
+    if (addedOnPage === 0) throw new Error(`Orders API повторил страницу ${page}; полный отчёт не сформирован`);
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц заказов');
@@ -359,14 +427,13 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
       page_size: String(PAGE_SIZE),
       page: String(page)
     });
-    const response = await fetch(`${API_BASE_URL}${REFUNDS_PATH}?${query}`, {
-      headers: { Authorization: `key ${apiKey}`, Accept: 'application/json' },
-      signal: AbortSignal.timeout(20_000)
-    });
-    const body = await response.json().catch(() => ({})) as RefundsResponse;
-    if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+    const body = await fetchApiPage<RefundsResponse>(apiKey, REFUNDS_PATH, query, 'Refunds', page);
     if (!Array.isArray(body.data)) throw new Error('Refunds API вернул ответ неизвестного формата');
-    if (Number.isFinite(body.pagination?.total)) expectedTotal = body.pagination!.total;
+    if (Number.isFinite(body.pagination?.total)) {
+      const pageTotal = body.pagination!.total!;
+      if (expectedTotal === undefined) expectedTotal = pageTotal;
+      else if (pageTotal !== expectedTotal) throw new Error(`Refunds API изменился во время загрузки: было ${expectedTotal}, стало ${pageTotal}`);
+    }
 
     const rows = body.data;
     Object.assign(ticketRefs, body.refs?.tickets || {});
@@ -378,7 +445,9 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
       refunds.push(refund);
       addedOnPage += 1;
     }
-    if (rows.length === 0 || addedOnPage === 0) break;
+    if (expectedTotal !== undefined && refunds.length >= expectedTotal) break;
+    if (rows.length === 0) break;
+    if (addedOnPage === 0) throw new Error(`Refunds API повторил страницу ${page}; полный отчёт не сформирован`);
     page += 1;
   }
   if (page > MAX_PAGES) throw new Error('Превышен лимит страниц возвратов');

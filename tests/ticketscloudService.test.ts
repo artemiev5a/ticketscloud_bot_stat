@@ -222,6 +222,7 @@ test('uses orders endpoint, key authentication and every page', async () => {
     assert.equal(orderRequests.length, 3);
     assert.equal(refundRequests.length, 1);
     assert.equal(orderRequests[0].url.searchParams.get('page_size'), '200');
+    assert.equal(orderRequests[0].url.searchParams.get('status'), 'done');
     assert.equal(orderRequests[0].url.searchParams.has('with_refunded_tickets'), false);
     assert.ok(orderRequests[0].url.searchParams.has('created_at'));
     assert.equal(orderRequests[0].authorization, 'key organizer-key');
@@ -252,7 +253,64 @@ test('reports incomplete pagination instead of silently showing wrong totals', a
 
   try {
     const result = await ticketscloudService.getStats('incomplete-pagination-key', 'today', true);
-    assert.match(result.text, /не все страницы: 1 из 2/);
+    assert.match(result.text, /повторил страницу 2/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('retries a timed out Orders page and identifies the resource', async () => {
+  const originalFetch = globalThis.fetch;
+  let orderAttempts = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [], pagination: { total: 0 } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    orderAttempts += 1;
+    if (orderAttempts === 1) {
+      const error = new Error('The operation was aborted due to timeout');
+      error.name = 'TimeoutError';
+      throw error;
+    }
+    return new Response(JSON.stringify({ data: [], pagination: { total: 0 } }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('retry-timeout-key', 'today', true);
+    assert.equal(orderAttempts, 2);
+    assert.match(result.text, /За выбранный период продаж нет/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('stops pagination as soon as the reported total is loaded', async () => {
+  const originalFetch = globalThis.fetch;
+  let orderRequests = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [], pagination: { total: 0 } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    orderRequests += 1;
+    const now = new Date(Date.now() - 60_000).toISOString();
+    return new Response(JSON.stringify({
+      data: [{ id: 'only-order', status: 'done', done_at: now, values: { nominal: 100 }, tickets: [] }],
+      pagination: { total: 1 }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('known-total-key', 'today', true);
+    assert.equal(orderRequests, 1);
+    assert.match(result.text, /100,00 ₽/);
   } finally {
     globalThis.fetch = originalFetch;
   }
