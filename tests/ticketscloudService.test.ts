@@ -8,38 +8,71 @@ test('matches the dashboard week boundaries in Moscow time', () => {
   assert.equal(range.to.toISOString(), '2026-08-27T07:27:00.000Z');
 });
 
-test('matches dashboard sales, ticket count and distinct same-title events', () => {
-  const successful = Array.from({ length: 82 }, (_, index) => ({
-    id: `done-${index}`,
-    status: 'done',
-    event: index === 81 ? 'event-b' : 'event-a',
-    values: index === 0
-      ? { full: 406585.9, price: 382669, extra: 23916.9 }
-      : { full: 0, price: 0, extra: 0 },
-    tickets: index === 0 ? Array.from({ length: 175 }, () => ({ status: 'done', price: 1000 })) : []
-  }));
-  const stats = aggregateOrders([
-    ...successful,
-    { id: 'refunded-1', status: 'refunded', event: 'event-b', values: { price: 0 }, tickets: [{ status: 'refunded', price: 14998 }] }
-  ], {
-    events: {
-      'event-a': { title: 'Одинаковое название', meta_event: 'meta-a' },
-      'event-b': { title: 'Одинаковое название', meta_event: 'meta-b' }
-    },
+test('matches Matyukhina dashboard with discounts and restored refunded tickets', () => {
+  const makeOrders = (event: string, count: number, ticketCount: number, nominal: number, price = nominal) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `${event}-order-${index}`,
+      status: 'done',
+      done_at: '2026-09-01T10:00:00Z',
+      event,
+      values: { nominal: index === 0 ? nominal : 0, price: index === 0 ? price : 0 },
+      tickets: index === 0
+        ? Array.from({ length: ticketCount }, (_, ticketIndex) => ({
+            id: `${event}-ticket-${ticketIndex}`,
+            nominal: ticketIndex === 0 ? nominal : 0,
+            price: ticketIndex === 0 ? price : 0
+          }))
+        : []
+    }));
+
+  const annushkaMoscow = makeOrders('annushka-moscow', 17, 60, 75_500, 135_500);
+  const annushkaSpb = makeOrders('annushka-spb', 17, 51, 42_000, 102_000);
+  const dolphin = makeOrders('dolphin-spb', 19, 30, 123_970);
+  dolphin[0].tickets![0] = { id: 'dolphin-refund-present', nominal: 3_999, price: 3_999 };
+  dolphin[0].tickets![1] = { id: 'dolphin-active', nominal: 119_971, price: 119_971 };
+  annushkaSpb[0].tickets![0].id = 'annushka-refund-1';
+  annushkaSpb[0].tickets![1].id = 'annushka-refund-2';
+
+  const orders = [
+    ...annushkaMoscow,
+    ...dolphin,
+    ...annushkaSpb,
+    ...makeOrders('rasteryayev-spb', 17, 18, 90_000),
+    ...makeOrders('avia', 8, 9, 23_000),
+    ...makeOrders('rasteryayev-novgorod', 2, 3, 18_000),
+    ...makeOrders('rasteryayev-crimea', 2, 3, 7_200),
+    ...makeOrders('dolphin-yaroslavl', 1, 2, 5_000),
+    ...makeOrders('dolphin-other', 1, 1, 3_500)
+  ];
+  const refs = {
+    events: Object.fromEntries([
+      ['annushka-moscow', 'annushka-meta-a'], ['annushka-spb', 'annushka-meta-b'],
+      ['dolphin-spb', 'dolphin-meta-a'], ['rasteryayev-spb', 'rasteryayev-meta-a'],
+      ['avia', 'avia-meta'], ['rasteryayev-novgorod', 'rasteryayev-meta-b'],
+      ['rasteryayev-crimea', 'rasteryayev-meta-c'], ['dolphin-yaroslavl', 'dolphin-meta-b'],
+      ['dolphin-other', 'dolphin-meta-c']
+    ].map(([event, meta_event]) => [event, { title: event, meta_event }])),
     meta_events: {
-      'meta-a': { title: 'Одинаковое название' },
-      'meta-b': { title: 'Одинаковое название' }
+      'annushka-meta-a': { title: 'аннушкаа. Презентация альбома' },
+      'annushka-meta-b': { title: 'аннушкаа. Презентация альбома' }
     }
+  };
+  const refunds = [
+    { id: 'refund-dolphin', status: 'approved', order: 'dolphin-spb-order-0', refund_nominal: 6_998, tickets: ['dolphin-refund-present', 'dolphin-refund-missing'] },
+    { id: 'refund-annushka', status: 'approved', order: 'annushka-spb-order-0', refund_nominal: 8_000, tickets: ['annushka-refund-1', 'annushka-refund-2'] }
+  ];
+  const stats = aggregateOrders(orders, refs, refunds, {
+    'dolphin-refund-missing': { id: 'dolphin-refund-missing', nominal: 2_999, price: 2_999 }
   });
 
-  assert.equal(stats.sales, 382669);
-  assert.equal(stats.successfulOrders, 82);
-  assert.equal(stats.ticketsSold, 176);
-  assert.equal(stats.refunds, 14998);
-  assert.equal(stats.ticketsRefunded, 1);
-  assert.equal(stats.events.size, 2);
-  assert.equal(stats.events.get('meta-a')?.title, 'Одинаковое название');
-  assert.equal(stats.events.get('meta-b')?.title, 'Одинаковое название');
+  assert.equal(stats.sales, 391_169);
+  assert.equal(stats.successfulOrders, 84);
+  assert.equal(stats.ticketsSold, 178);
+  assert.equal(stats.refunds, 14_998);
+  assert.equal(stats.ticketsRefunded, 4);
+  assert.equal(stats.events.get('annushka-meta-a')?.sales, 75_500);
+  assert.equal(stats.events.get('annushka-meta-b')?.sales, 42_000);
+  assert.equal(stats.events.get('dolphin-meta-a')?.tickets, 31);
 });
 
 test('uses orders endpoint, key authentication and every page', async () => {
@@ -49,6 +82,11 @@ test('uses orders endpoint, key authentication and every page', async () => {
     const url = new URL(input.toString());
     requests.push({ url, authorization: new Headers(init?.headers).get('Authorization') });
     const page = Number(url.searchParams.get('page'));
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [], refs: { tickets: {} } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
     const now = new Date(Date.now() - 60_000).toISOString();
     const rows = page === 1
       // API может вернуть меньше запрошенного page_size и не прислать
@@ -56,10 +94,10 @@ test('uses orders endpoint, key authentication and every page', async () => {
       ? Array.from({ length: 20 }, (_, index) => ({
           id: `order-${index}`,
           status: 'done', event: `event-${index}`, done_at: now,
-          values: { full: 100, price: 90 }, tickets: [{ status: 'done', full: 100 }]
+          values: { full: 100, price: 100, nominal: 90 }, tickets: [{ status: 'done', full: 100, price: 100, nominal: 90 }]
         }))
       : page === 2
-        ? [{ id: 'last-order', status: 'done', event: 'last-event', done_at: now, values: { full: 50 }, tickets: [] }]
+        ? [{ id: 'last-order', status: 'done', event: 'last-event', done_at: now, values: { full: 50, nominal: 50 }, tickets: [] }]
         : [];
     return new Response(JSON.stringify({
       data: rows,
@@ -69,11 +107,16 @@ test('uses orders endpoint, key authentication and every page', async () => {
 
   try {
     const result = await ticketscloudService.getStats(' organizer-key ', 'week');
-    assert.equal(requests.length, 3);
-    assert.equal(requests[0].url.pathname, '/v2/resources/orders');
-    assert.equal(requests[0].url.searchParams.get('page_size'), '200');
-    assert.ok(requests[0].url.searchParams.has('created_at'));
-    assert.equal(requests[0].authorization, 'key organizer-key');
+    const orderRequests = requests.filter(request => request.url.pathname === '/v2/resources/orders');
+    const refundRequests = requests.filter(request => request.url.pathname === '/v2/resources/refund_requests');
+    assert.equal(orderRequests.length, 3);
+    assert.equal(refundRequests.length, 1);
+    assert.equal(orderRequests[0].url.searchParams.get('page_size'), '200');
+    assert.equal(orderRequests[0].url.searchParams.get('with_refunded_tickets'), 'true');
+    assert.ok(orderRequests[0].url.searchParams.has('created_at'));
+    assert.equal(orderRequests[0].authorization, 'key organizer-key');
+    assert.equal(refundRequests[0].url.searchParams.get('status'), 'approved');
+    assert.ok(refundRequests[0].url.searchParams.has('finished_at'));
     assert.match(result.text, /1\s850,00 ₽/);
     assert.doesNotMatch(result.text, /Сервисный сбор/);
     assert.doesNotMatch(result.text, /Комиссия|Доход к выплате/);

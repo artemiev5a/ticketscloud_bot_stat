@@ -4,6 +4,7 @@ type Money = string | number;
 type LocalizedTitle = string | { text?: string };
 
 type Ticket = {
+  id?: string;
   status?: string;
   full?: Money;
   price?: Money;
@@ -38,6 +39,29 @@ type OrdersResponse = {
   errors?: string[];
 };
 
+type RefundRequest = {
+  id?: string;
+  status?: string;
+  created_at?: string;
+  finished_at?: string;
+  refund_nominal?: Money;
+  delta?: Money;
+  event?: string;
+  order?: string;
+  tickets?: string[];
+};
+
+type RefundsResponse = {
+  data?: RefundRequest[];
+  pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
+  refs?: {
+    tickets?: Record<string, Ticket>;
+  };
+  reason?: string;
+  message?: string;
+  errors?: string[];
+};
+
 type EventStats = { title: string; orders: number; tickets: number; sales: number };
 type BotStatsResponse = {
   text: string;
@@ -46,6 +70,7 @@ type BotStatsResponse = {
 
 const API_BASE_URL = (process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '');
 const ORDERS_PATH = '/v2/resources/orders';
+const REFUNDS_PATH = '/v2/resources/refund_requests';
 const PAGE_SIZE = 200;
 const MAX_PAGES = 1_000;
 const CACHE_TTL_MS = 30_000;
@@ -54,7 +79,6 @@ const ORDER_LOOKBACK_DAYS = Math.max(7, Number(process.env.ORDER_LOOKBACK_DAYS) 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const SUCCESSFUL_ORDER_STATUSES = new Set(['done', 'partially_refunded']);
 const REFUNDED_ORDER_STATUSES = new Set(['refunded', 'returned']);
-const REFUNDED_TICKET_STATUSES = new Set(['refunded', 'returned', 'canceled', 'cancelled']);
 const cache = new Map<string, { data: BotStatsResponse; expiresAt: number }>();
 
 function asNumber(value: unknown): number {
@@ -116,30 +140,64 @@ function eventIdentity(order: Order, refs: OrdersResponse['refs']): { key: strin
 }
 
 function orderSales(order: Order): number {
-  // В Orders API `full = price + extra`. Кабинет показывает `price` в
-  // колонке «Продажи», а `extra` не является его колонкой «Сервисный сбор».
-  return asNumber(order.values?.price ?? order.values?.nominal ?? order.values?.full);
+  // В TicketsCloud `price` — цена до скидки, `nominal` — фактически
+  // оплаченная стоимость билета, а `full = nominal + extra`. Кабинет в
+  // колонке «Продажи» суммирует nominal и не включает extra.
+  const tickets = Array.isArray(order.tickets) ? order.tickets : [];
+  if (tickets.length > 0 && tickets.every(ticket => ticket.nominal !== undefined || ticket.price !== undefined)) {
+    return tickets.reduce((sum, ticket) => sum + asNumber(ticket.nominal ?? ticket.price), 0);
+  }
+  return asNumber(order.values?.nominal ?? order.values?.price ?? order.values?.full);
 }
 
-function ticketRefund(ticket: Ticket): number {
-  return asNumber(ticket.full ?? ticket.price ?? ticket.nominal);
+function isCompletedSale(order: Order): boolean {
+  // После возврата текущий статус заказа может измениться, но done_at
+  // сохраняет факт состоявшейся продажи. У отменённой до оплаты брони done_at нет.
+  return Boolean(order.done_at)
+    || SUCCESSFUL_ORDER_STATUSES.has(order.status?.toLowerCase() || '')
+    || REFUNDED_ORDER_STATUSES.has(order.status?.toLowerCase() || '');
 }
 
-export function aggregateOrders(orders: Order[], refs?: OrdersResponse['refs']) {
+function restoreRefundedTickets(
+  orders: Order[],
+  refunds: RefundRequest[],
+  refundTicketRefs?: Record<string, Ticket>
+): Order[] {
+  const byOrder = new Map(orders.filter(order => order.id).map(order => [order.id!, order]));
+  for (const refund of refunds) {
+    const order = refund.order ? byOrder.get(refund.order) : undefined;
+    if (!order) continue;
+    const tickets = Array.isArray(order.tickets) ? [...order.tickets] : [];
+    const present = new Set(tickets.map(ticket => ticket.id).filter(Boolean));
+    for (const ticketId of refund.tickets || []) {
+      if (present.has(ticketId)) continue;
+      const ticket = refundTicketRefs?.[ticketId];
+      if (!ticket) throw new Error(`API не вернул данные возвращённого билета ${ticketId}`);
+      tickets.push({ ...ticket, id: ticket.id || ticketId });
+      present.add(ticketId);
+    }
+    order.tickets = tickets;
+  }
+  return orders;
+}
+
+export function aggregateOrders(
+  orders: Order[],
+  refs?: OrdersResponse['refs'],
+  refunds: RefundRequest[] = [],
+  refundTicketRefs?: Record<string, Ticket>
+) {
+  restoreRefundedTickets(orders, refunds, refundTicketRefs);
   let sales = 0;
   let successfulOrders = 0;
   let ticketsSold = 0;
-  let refunds = 0;
-  let ticketsRefunded = 0;
+  const refundAmount = refunds.reduce((sum, refund) => sum + asNumber(refund.refund_nominal ?? refund.delta), 0);
+  const refundedTicketIds = new Set(refunds.flatMap(refund => refund.tickets || []));
   const events = new Map<string, EventStats>();
 
   for (const order of orders) {
-    const status = order.status?.toLowerCase() || '';
     const tickets = Array.isArray(order.tickets) ? order.tickets : [];
-    const isSuccessful = SUCCESSFUL_ORDER_STATUSES.has(status);
-    const isFullyRefunded = REFUNDED_ORDER_STATUSES.has(status);
-
-    if (isSuccessful) {
+    if (isCompletedSale(order)) {
       const amount = orderSales(order);
       successfulOrders += 1;
       sales += amount;
@@ -151,28 +209,17 @@ export function aggregateOrders(orders: Order[], refs?: OrdersResponse['refs']) 
       event.tickets += tickets.length;
       event.sales += amount;
       events.set(identity.key, event);
-    } else if (isFullyRefunded) {
-      // Кабинет не считает такой заказ успешным, но сохраняет исходно
-      // проданные билеты в счётчике «Продажи → билеты».
-      ticketsSold += tickets.length;
-      const identity = eventIdentity(order, refs);
-      const event = events.get(identity.key) || { title: identity.title, orders: 0, tickets: 0, sales: 0 };
-      event.tickets += tickets.length;
-      events.set(identity.key, event);
-    }
-
-    const refundedTickets = tickets.filter(ticket => REFUNDED_TICKET_STATUSES.has(ticket.status?.toLowerCase() || ''));
-    if (refundedTickets.length > 0) {
-      ticketsRefunded += refundedTickets.length;
-      refunds += refundedTickets.reduce((sum, ticket) => sum + ticketRefund(ticket), 0);
-    } else if (REFUNDED_ORDER_STATUSES.has(status)) {
-      // Некоторые варианты Orders API отмечают возврат только на уровне заказа.
-      ticketsRefunded += tickets.length;
-      refunds += orderSales(order);
     }
   }
 
-  return { sales, successfulOrders, ticketsSold, refunds, ticketsRefunded, events };
+  return {
+    sales,
+    successfulOrders,
+    ticketsSold,
+    refunds: refundAmount,
+    ticketsRefunded: refundedTicketIds.size,
+    events
+  };
 }
 
 async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orders: Order[]; refs: NonNullable<OrdersResponse['refs']> }> {
@@ -185,6 +232,7 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   while (page <= MAX_PAGES) {
     const query = new URLSearchParams({
       created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
+      with_refunded_tickets: 'true',
       page_size: String(PAGE_SIZE),
       page: String(page)
     });
@@ -217,6 +265,46 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   return { orders, refs };
 }
 
+async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
+  refunds: RefundRequest[];
+  ticketRefs: Record<string, Ticket>;
+}> {
+  const refunds: RefundRequest[] = [];
+  const ticketRefs: Record<string, Ticket> = {};
+  const seen = new Set<string>();
+  let page = 1;
+
+  while (page <= MAX_PAGES) {
+    const query = new URLSearchParams({
+      finished_at: `${from.toISOString()},${to.toISOString()}`,
+      status: 'approved',
+      page_size: String(PAGE_SIZE),
+      page: String(page)
+    });
+    const response = await fetch(`${API_BASE_URL}${REFUNDS_PATH}?${query}`, {
+      headers: { Authorization: `key ${apiKey}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(20_000)
+    });
+    const body = await response.json().catch(() => ({})) as RefundsResponse;
+    if (!response.ok) throw new Error(body.reason || body.message || body.errors?.join(', ') || `HTTP ${response.status}`);
+
+    const rows = Array.isArray(body.data) ? body.data : [];
+    Object.assign(ticketRefs, body.refs?.tickets || {});
+    let addedOnPage = 0;
+    for (const refund of rows) {
+      const identity = refund.id || JSON.stringify(refund);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      refunds.push(refund);
+      addedOnPage += 1;
+    }
+    if (rows.length === 0 || addedOnPage === 0) break;
+    page += 1;
+  }
+  if (page > MAX_PAGES) throw new Error('Превышен лимит страниц возвратов');
+  return { refunds, ticketRefs };
+}
+
 function dateLabel(date: Date): string {
   return new Intl.DateTimeFormat('ru-RU', { timeZone: REPORT_TIME_ZONE, day: 'numeric', month: 'long' }).format(date);
 }
@@ -239,8 +327,12 @@ export const ticketscloudService = {
     if (cached && cached.expiresAt > Date.now()) return { ...cached.data, text: `${cached.data.text}\n\n<i>⚡ Данные из кэша (30 сек)</i>` };
 
     let fetched: Awaited<ReturnType<typeof fetchOrders>>;
+    let fetchedRefunds: Awaited<ReturnType<typeof fetchRefunds>>;
     try {
-      fetched = await fetchOrders(normalizedKey, from, to);
+      [fetched, fetchedRefunds] = await Promise.all([
+        fetchOrders(normalizedKey, from, to),
+        fetchRefunds(normalizedKey, from, to)
+      ]);
     } catch (error: any) {
       return {
         text: `⚠️ <b>Не удалось получить статистику</b>\nAPI вернул: <code>${escapeHtml(error?.message || error)}</code>`,
@@ -254,7 +346,7 @@ export const ticketscloudService = {
       const completedAt = new Date(value);
       return !Number.isNaN(completedAt.valueOf()) && completedAt >= from && completedAt <= to;
     });
-    const stats = aggregateOrders(selected, fetched.refs);
+    const stats = aggregateOrders(selected, fetched.refs, fetchedRefunds.refunds, fetchedRefunds.ticketRefs);
     const eventLines = [...stats.events.entries()]
       .sort((a, b) => b[1].sales - a[1].sales)
       .slice(0, 10)
