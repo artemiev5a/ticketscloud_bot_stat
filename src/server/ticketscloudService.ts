@@ -370,7 +370,6 @@ async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orde
   while (page <= MAX_PAGES) {
     const query = new URLSearchParams({
       created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
-      status: 'done',
       page_size: String(PAGE_SIZE),
       page: String(page)
     });

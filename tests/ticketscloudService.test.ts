@@ -222,7 +222,10 @@ test('uses orders endpoint, key authentication and every page', async () => {
     assert.equal(orderRequests.length, 3);
     assert.equal(refundRequests.length, 1);
     assert.equal(orderRequests[0].url.searchParams.get('page_size'), '200');
-    assert.equal(orderRequests[0].url.searchParams.get('status'), 'done');
+    // Живой Orders API обрезал выборку до одной страницы (200 записей),
+    // когда ему передавали status=done. Загружаем все статусы и безопасно
+    // фильтруем их после полной пагинации.
+    assert.equal(orderRequests[0].url.searchParams.has('status'), false);
     assert.equal(orderRequests[0].url.searchParams.has('with_refunded_tickets'), false);
     assert.ok(orderRequests[0].url.searchParams.has('created_at'));
     assert.equal(orderRequests[0].authorization, 'key organizer-key');
