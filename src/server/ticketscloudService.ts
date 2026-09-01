@@ -101,7 +101,10 @@ const CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CACHE_MAX_ENTRIES) || 
 const CACHE_FORMULA_VERSION = 'orders-v5-full-pagination';
 const CACHE_KEY_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
 const API_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.TICKETSCLOUD_REQUEST_TIMEOUT_MS) || 45_000);
-const API_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.TICKETSCLOUD_MAX_ATTEMPTS) || 2));
+// Длинный отчёт может состоять из десятков страниц. Ticketscloud иногда
+// отвечает 504 на одной из них, хотя повтор того же запроса проходит успешно.
+// Держим уже загруженные страницы в памяти и повторяем только упавшую.
+const API_MAX_ATTEMPTS = Math.max(1, Math.min(8, Number(process.env.TICKETSCLOUD_MAX_ATTEMPTS) || 5));
 const REPORT_TIME_ZONE = process.env.REPORT_TIME_ZONE || 'Europe/Moscow';
 const ORDER_LOOKBACK_DAYS = Math.max(7, Number(process.env.ORDER_LOOKBACK_DAYS) || 90);
 const DAY_MS = 24 * 60 * 60 * 1_000;

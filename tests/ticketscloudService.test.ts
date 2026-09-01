@@ -292,6 +292,42 @@ test('retries a timed out Orders page and identifies the resource', async () => 
   }
 });
 
+test('keeps the completed pages and retries a temporary HTTP 504', async () => {
+  const originalFetch = globalThis.fetch;
+  const attemptsByPage = new Map<number, number>();
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const page = Number(url.searchParams.get('page'));
+    const attempt = (attemptsByPage.get(page) || 0) + 1;
+    attemptsByPage.set(page, attempt);
+    if (page === 2 && attempt < 4) {
+      return new Response('', { status: 504, headers: { 'Retry-After': '0' } });
+    }
+    const data = page <= 2
+      ? [{ id: `resilient-order-${page}`, status: 'done', done_at: new Date(Date.now() - 60_000).toISOString(), values: { nominal: 100 }, tickets: [] }]
+      : [];
+    return new Response(JSON.stringify({ data }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('temporary-504-key', 'today', true);
+    assert.equal(attemptsByPage.get(1), 1);
+    assert.equal(attemptsByPage.get(2), 4);
+    assert.equal(attemptsByPage.get(3), 1);
+    assert.match(result.text, /Успешных заказов: <b>2<\/b>/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('does not stop on an unreliable page-local pagination total', async () => {
   const originalFetch = globalThis.fetch;
   let orderRequests = 0;
