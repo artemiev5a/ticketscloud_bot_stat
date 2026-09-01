@@ -319,6 +319,54 @@ test('stops pagination as soon as the reported total is loaded', async () => {
   }
 });
 
+test('loads all 668 live-style orders without the broken server-side status filter', async () => {
+  const originalFetch = globalThis.fetch;
+  const orderPages: number[] = [];
+  const now = new Date(Date.now() - 60_000).toISOString();
+  const orders = Array.from({ length: 668 }, (_, index) => ({
+    id: `large-order-${index}`,
+    status: 'done',
+    done_at: now,
+    values: { nominal: 100 },
+    tickets: [{ id: `large-ticket-${index}`, nominal: 100 }]
+  }));
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({
+        data: [{ id: 'large-refund', status: 'approved', refund_nominal: 2_500, tickets: ['refund-ticket'] }],
+        refs: { tickets: {} },
+        pagination: { total: 1 }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    const page = Number(url.searchParams.get('page'));
+    orderPages.push(page);
+    // Воспроизводит живой дефект Ticketscloud: status=done ошибочно
+    // ограничивал результат одной страницей и total=200.
+    const hasBrokenFilter = url.searchParams.has('status');
+    const rows = hasBrokenFilter
+      ? orders.slice(0, 200)
+      : orders.slice((page - 1) * 200, page * 200);
+    return new Response(JSON.stringify({
+      data: rows,
+      pagination: { total: hasBrokenFilter ? 200 : 668 }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('live-668-key', 'today', true);
+    assert.deepEqual(orderPages, [1, 2, 3, 4]);
+    assert.match(result.text, /66\s800,00 ₽/);
+    assert.match(result.text, /Успешных заказов: <b>668<\/b>/);
+    assert.match(result.text, /Билетов: <b>668<\/b>/);
+    assert.match(result.text, /2\s500,00 ₽<\/b> \(1 бил\.\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('does not call API without organizer key', async () => {
   const result = await ticketscloudService.getStats('');
   assert.match(result.text, /API-ключ не указан/);

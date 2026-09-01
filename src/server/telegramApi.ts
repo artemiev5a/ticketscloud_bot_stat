@@ -30,6 +30,24 @@ export const telegramApi = {
     return data.result;
   },
 
+  async editMessageText(token: string, chatId: number, messageId: number, text: string, options: any = {}) {
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: options.parseMode,
+      reply_markup: options.replyMarkup
+    };
+    const res = await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description);
+    return data.result;
+  },
+
   async answerCallbackQuery(token: string, callbackQueryId: string, text?: string) {
     const payload: any = { callback_query_id: callbackQueryId };
     if (text) payload.text = text;

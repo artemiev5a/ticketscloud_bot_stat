@@ -1,9 +1,11 @@
-import { ActivityLog, BotCommand, BotConfig, BotInfo, ChatSession, TelegramUpdate } from '../types/telegram.js';
-import { telegramApi } from './telegramApi.js';
-import { ticketscloudService, StatsPeriod } from './ticketscloudService.js';
-import { encryptApiKey, decryptApiKey } from './cryptoUtils.js';
+import type { ActivityLog, BotCommand, BotConfig, BotInfo, ChatSession, TelegramUpdate } from '../types/telegram.ts';
+import { telegramApi } from './telegramApi.ts';
+import { ticketscloudService } from './ticketscloudService.ts';
+import type { StatsPeriod } from './ticketscloudService.ts';
+import { encryptApiKey, decryptApiKey } from './cryptoUtils.ts';
+import { createHash } from 'node:crypto';
 
-class TelegramBotEngine {
+export class TelegramBotEngine {
   private config: BotConfig = {
     token: process.env.TELEGRAM_BOT_TOKEN || '',
     isPollingActive: true,
@@ -22,8 +24,18 @@ class TelegramBotEngine {
   private commands: Map<string, BotCommand> = new Map();
   private userApiKeys: Map<number, string> = new Map();
   private awaitingKeyUsers: Set<number> = new Set();
+  private apiKeyGeneration: Map<number, number> = new Map();
+  private statsJobs: Map<string, Promise<void>> = new Map();
+  private upstreamStatsJobs: Map<string, Promise<Awaited<ReturnType<typeof ticketscloudService.getStats>>>> = new Map();
+  private readonly statsService: Pick<typeof ticketscloudService, 'getStats'>;
+  private readonly telegramClient: typeof telegramApi;
 
-  constructor() {
+  constructor(
+    statsService: Pick<typeof ticketscloudService, 'getStats'> = ticketscloudService,
+    telegramClient: typeof telegramApi = telegramApi
+  ) {
+    this.statsService = statsService;
+    this.telegramClient = telegramClient;
     this.initializeDefaultCommands();
     this.addLog('system', 'Telegram Bot Engine initialized', 'Ready to start');
     
@@ -107,7 +119,7 @@ class TelegramBotEngine {
       const webhookResult = await webhookResponse.json() as any;
       if (!webhookResult.ok) throw new Error(webhookResult.description || 'Не удалось отключить webhook');
       
-      this.botInfo = await telegramApi.getMe(this.config.token);
+      this.botInfo = await this.telegramClient.getMe(this.config.token);
       this.addLog('system', 'Telegram Token Connected', `@${this.botInfo?.username || 'unknown'}`);
       this.syncCommandsToTelegram().catch(() => {});
     } catch (err: any) { this.addLog('error', 'Failed to connect', err.message); }
@@ -127,7 +139,7 @@ class TelegramBotEngine {
 
     try {
       if (this.config.token) {
-        const updates = await telegramApi.getUpdates(this.config.token, this.lastUpdateOffset, 3);
+        const updates = await this.telegramClient.getUpdates(this.config.token, this.lastUpdateOffset, 3);
         for (const update of updates) {
           this.lastUpdateOffset = Math.max(this.lastUpdateOffset, update.update_id + 1);
           await this.handleUpdate(update);
@@ -149,6 +161,7 @@ class TelegramBotEngine {
   private saveApiKey(text: string, userId: number) {
     const key = text.trim();
     this.userApiKeys.set(userId, encryptApiKey(key));
+    this.apiKeyGeneration.set(userId, (this.apiKeyGeneration.get(userId) || 0) + 1);
   }
 
   private async handleMessage(msg: any, rawUpdate: TelegramUpdate) {
@@ -193,12 +206,12 @@ class TelegramBotEngine {
     // 3. Обработка команд
     if (text.startsWith('/')) {
       const rawCmd = text.split(' ')[0].substring(1).replace(/@.*/, '').toLowerCase();
-      if (rawCmd === 'stats') { await this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
+      if (rawCmd === 'stats') { this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
 
       const matchedCmd = this.commands.get(rawCmd);
       if (matchedCmd && matchedCmd.enabled) {
         if (matchedCmd.responseType === 'ticketscloud_stats' || matchedCmd.responseType === 'stats') {
-          await this.sendTicketscloudStats(chatId, user.id, 'today');
+          this.sendTicketscloudStats(chatId, user.id, 'today');
         } else {
           await this.sendBotReply(chatId, matchedCmd.responseText || 'Выполнено', matchedCmd.buttons);
         }
@@ -217,12 +230,29 @@ class TelegramBotEngine {
     const data = cb.data;
     const user = cb.from;
 
-    try { if (this.config.token) await telegramApi.answerCallbackQuery(this.config.token, cb.id); } catch (e) {}
+    const requestedPeriod: StatsPeriod | undefined =
+      data === 'stats_week' || data === 'refresh_stats_week' ? 'week'
+        : data === 'stats_today' || data === 'btn_stats' || data === 'refresh_stats' || data === 'refresh_stats_today' ? 'today'
+          : undefined;
+    if (requestedPeriod && this.statsJobs.has(`${user.id}:${requestedPeriod}`)) {
+      try {
+        if (this.config.token) {
+          await this.telegramClient.answerCallbackQuery(
+            this.config.token,
+            cb.id,
+            'Статистика уже обновляется. Результат появится автоматически.'
+          );
+        }
+      } catch (e) {}
+      return;
+    }
 
-    if (data === 'stats_today' || data === 'btn_stats') { await this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
-    if (data === 'stats_week') { await this.sendTicketscloudStats(chatId, user.id, 'week'); return; }
-    if (data === 'refresh_stats' || data === 'refresh_stats_today') { await this.sendTicketscloudStats(chatId, user.id, 'today', true); return; }
-    if (data === 'refresh_stats_week') { await this.sendTicketscloudStats(chatId, user.id, 'week', true); return; }
+    try { if (this.config.token) await this.telegramClient.answerCallbackQuery(this.config.token, cb.id); } catch (e) {}
+
+    if (data === 'stats_today' || data === 'btn_stats') { this.sendTicketscloudStats(chatId, user.id, 'today'); return; }
+    if (data === 'stats_week') { this.sendTicketscloudStats(chatId, user.id, 'week'); return; }
+    if (data === 'refresh_stats' || data === 'refresh_stats_today') { this.sendTicketscloudStats(chatId, user.id, 'today', true); return; }
+    if (data === 'refresh_stats_week') { this.sendTicketscloudStats(chatId, user.id, 'week', true); return; }
 
     if (data === 'prompt_set_key') {
       this.awaitingKeyUsers.add(user.id);
@@ -236,9 +266,54 @@ class TelegramBotEngine {
     }
   }
 
-  public async sendTicketscloudStats(chatId: number, userId: number = chatId, period: StatsPeriod = 'today', forceRefresh = false) {
+  public sendTicketscloudStats(chatId: number, userId: number = chatId, period: StatsPeriod = 'today', forceRefresh = false) {
+    const jobKey = `${userId}:${period}`;
+    if (this.statsJobs.has(jobKey)) return;
+    const generation = this.apiKeyGeneration.get(userId) || 0;
+    const job = this.runTicketscloudStats(chatId, userId, period, forceRefresh, generation)
+      .catch((error: any) => this.addLog('error', 'Stats background job failed', error?.message || String(error), chatId))
+      .finally(() => {
+        if (this.statsJobs.get(jobKey) === job) this.statsJobs.delete(jobKey);
+      });
+    this.statsJobs.set(jobKey, job);
+  }
+
+  private loadStats(apiKey: string, period: StatsPeriod, forceRefresh: boolean) {
+    const fingerprint = createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+    const flightKey = `${fingerprint}:${period}:${forceRefresh ? 'force' : 'normal'}`;
+    const existing = this.upstreamStatsJobs.get(flightKey);
+    if (existing) return existing;
+    let tracked: Promise<Awaited<ReturnType<typeof ticketscloudService.getStats>>>;
+    tracked = Promise.resolve()
+      .then(() => this.statsService.getStats(apiKey, period, forceRefresh))
+      .then(
+        result => {
+          if (this.upstreamStatsJobs.get(flightKey) === tracked) this.upstreamStatsJobs.delete(flightKey);
+          return result;
+        },
+        error => {
+          if (this.upstreamStatsJobs.get(flightKey) === tracked) this.upstreamStatsJobs.delete(flightKey);
+          throw error;
+        }
+      );
+    this.upstreamStatsJobs.set(flightKey, tracked);
+    return tracked;
+  }
+
+  private async runTicketscloudStats(
+    chatId: number,
+    userId: number,
+    period: StatsPeriod,
+    forceRefresh: boolean,
+    generation: number
+  ) {
+    const periodLabel = period === 'week' ? 'Последние 7 дней' : 'Сегодня';
+    const loading = await this.sendBotReply(
+      chatId,
+      `⏳ <b>Собираю статистику Ticketscloud…</b>\n\nПериод: <b>${periodLabel}</b>\nРезультат появится автоматически.`
+    );
     const encryptedKey = this.userApiKeys.get(userId) || '';
-    try { if (this.config.token) await telegramApi.sendChatAction(this.config.token, chatId, 'typing'); } catch (e) {}
+    try { if (this.config.token) await this.telegramClient.sendChatAction(this.config.token, chatId, 'typing'); } catch (e) {}
 
     let realApiKey = '';
 
@@ -252,17 +327,36 @@ class TelegramBotEngine {
       }
     }
     
-    const res = await ticketscloudService.getStats(realApiKey, period, forceRefresh);
-    await this.sendBotReply(chatId, res.text, res.reply_markup?.inline_keyboard);
+    const res = await this.loadStats(realApiKey, period, forceRefresh);
+    if ((this.apiKeyGeneration.get(userId) || 0) !== generation) return;
+    const buttons = res.reply_markup?.inline_keyboard;
+    const edited = loading?.message_id
+      ? await this.editBotReply(chatId, loading.message_id, res.text, buttons)
+      : false;
+    if (!edited) await this.sendBotReply(chatId, res.text, buttons);
   }
 
   public async sendBotReply(chatId: number, text: string, buttons?: Array<Array<{ text: string; url?: string; callback_data?: string }>>) {
     try {
       if (!this.config.token) return;
       const replyMarkup = buttons && buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
-      await telegramApi.sendMessage(this.config.token, chatId, text, { parseMode: 'HTML', replyMarkup });
+      const sent = await this.telegramClient.sendMessage(this.config.token, chatId, text, { parseMode: 'HTML', replyMarkup });
       this.recordUserMessage(chatId, { id: chatId, is_bot: false, first_name: 'Chat' }, text, 'bot', buttons);
+      return sent;
     } catch (err: any) { this.addLog('error', `Failed to send`, err.message, chatId); }
+  }
+
+  private async editBotReply(chatId: number, messageId: number, text: string, buttons?: Array<Array<{ text: string; url?: string; callback_data?: string }>>) {
+    try {
+      if (!this.config.token) return false;
+      const replyMarkup = buttons && buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
+      await this.telegramClient.editMessageText(this.config.token, chatId, messageId, text, { parseMode: 'HTML', replyMarkup });
+      this.recordUserMessage(chatId, { id: chatId, is_bot: false, first_name: 'Chat' }, text, 'bot', buttons);
+      return true;
+    } catch (err: any) {
+      this.addLog('error', 'Failed to edit loading message', err.message, chatId);
+      return false;
+    }
   }
 
   private recordUserMessage(chatId: number, user: any, text: string, sender: 'user' | 'bot', buttons?: any) {
