@@ -3,7 +3,9 @@ import { telegramApi } from './telegramApi.ts';
 import { ticketscloudService } from './ticketscloudService.ts';
 import type { StatsPeriod } from './ticketscloudService.ts';
 import { encryptApiKey, decryptApiKey } from './cryptoUtils.ts';
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
+
+const STATS_FLIGHT_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
 
 export class TelegramBotEngine {
   private config: BotConfig = {
@@ -27,11 +29,13 @@ export class TelegramBotEngine {
   private apiKeyGeneration: Map<number, number> = new Map();
   private statsJobs: Map<string, Promise<void>> = new Map();
   private upstreamStatsJobs: Map<string, Promise<Awaited<ReturnType<typeof ticketscloudService.getStats>>>> = new Map();
-  private readonly statsService: Pick<typeof ticketscloudService, 'getStats'>;
+  private readonly statsService: Pick<typeof ticketscloudService, 'getStats'>
+    & Partial<Pick<typeof ticketscloudService, 'getCachedStats'>>;
   private readonly telegramClient: typeof telegramApi;
 
   constructor(
-    statsService: Pick<typeof ticketscloudService, 'getStats'> = ticketscloudService,
+    statsService: Pick<typeof ticketscloudService, 'getStats'>
+      & Partial<Pick<typeof ticketscloudService, 'getCachedStats'>> = ticketscloudService,
     telegramClient: typeof telegramApi = telegramApi
   ) {
     this.statsService = statsService;
@@ -279,8 +283,10 @@ export class TelegramBotEngine {
   }
 
   private loadStats(apiKey: string, period: StatsPeriod, forceRefresh: boolean) {
-    const fingerprint = createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
-    const flightKey = `${fingerprint}:${period}:${forceRefresh ? 'force' : 'normal'}`;
+    const fingerprint = createHmac('sha256', STATS_FLIGHT_SECRET).update(apiKey).digest('hex');
+    // Fresh cache hits return before this method. Any call that reaches the
+    // network (cache miss, stale or manual refresh) can safely share one load.
+    const flightKey = `${fingerprint}:${period}`;
     const existing = this.upstreamStatsJobs.get(flightKey);
     if (existing) return existing;
     let tracked: Promise<Awaited<ReturnType<typeof ticketscloudService.getStats>>>;
@@ -312,6 +318,7 @@ export class TelegramBotEngine {
       chatId,
       `⏳ <b>Собираю статистику Ticketscloud…</b>\n\nПериод: <b>${periodLabel}</b>\nРезультат появится автоматически.`
     );
+    let statusMessageId = loading?.message_id as number | undefined;
     const encryptedKey = this.userApiKeys.get(userId) || '';
     try { if (this.config.token) await this.telegramClient.sendChatAction(this.config.token, chatId, 'typing'); } catch (e) {}
 
@@ -326,12 +333,25 @@ export class TelegramBotEngine {
         realApiKey = decrypted; // Для обратной совместимости, если ключ сохраняли до этого обновления
       }
     }
-    
+
+    const cached = this.statsService.getCachedStats?.(realApiKey, period, forceRefresh);
+    if (cached) {
+      const cachedButtons = cached.data.reply_markup?.inline_keyboard;
+      const edited = statusMessageId
+        ? await this.editBotReply(chatId, statusMessageId, cached.data.text, cachedButtons)
+        : false;
+      if (!edited) {
+        const sent = await this.sendBotReply(chatId, cached.data.text, cachedButtons);
+        statusMessageId = sent?.message_id;
+      }
+      if (cached.isFresh && !forceRefresh) return;
+    }
+
     const res = await this.loadStats(realApiKey, period, forceRefresh);
     if ((this.apiKeyGeneration.get(userId) || 0) !== generation) return;
     const buttons = res.reply_markup?.inline_keyboard;
-    const edited = loading?.message_id
-      ? await this.editBotReply(chatId, loading.message_id, res.text, buttons)
+    const edited = statusMessageId
+      ? await this.editBotReply(chatId, statusMessageId, res.text, buttons)
       : false;
     if (!edited) await this.sendBotReply(chatId, res.text, buttons);
   }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregateOrders, parseApiDate, periodRange, selectOrdersForRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
+import { aggregateOrders, makeStatsCacheKey, parseApiDate, periodRange, selectOrdersForRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
 
 test('matches the dashboard week boundaries in Moscow time', () => {
   const range = periodRange('week', new Date('2026-08-27T07:27:00Z'));
@@ -365,6 +365,75 @@ test('loads all 668 live-style orders without the broken server-side status filt
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('serves only aggregate cache with timestamp and falls back after refresh failure', async () => {
+  const originalFetch = globalThis.fetch;
+  let orderRequests = 0;
+  let refundRequests = 0;
+  let failRefunds = false;
+  const now = new Date(Date.now() - 60_000).toISOString();
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      refundRequests += 1;
+      if (failRefunds) {
+        return new Response(JSON.stringify({ reason: 'forbidden' }), {
+          status: 403, headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({ data: [], pagination: { total: 0 } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    orderRequests += 1;
+    return new Response(JSON.stringify({
+      data: [{ id: 'cache-order', status: 'done', done_at: now, values: { nominal: 123 }, tickets: [] }],
+      pagination: { total: 1 }
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const first = await ticketscloudService.getStats('aggregate-cache-secret', 'today', true);
+    assert.match(first.text, /123,00 ₽/);
+    assert.match(first.text, /Проверено:/);
+    assert.equal(orderRequests, 1);
+    assert.equal(refundRequests, 1);
+
+    const second = await ticketscloudService.getStats('aggregate-cache-secret', 'today');
+    assert.match(second.text, /123,00 ₽/);
+    assert.equal(orderRequests, 1, 'fresh aggregate cache must avoid Orders API');
+    assert.equal(refundRequests, 1, 'fresh aggregate cache must avoid Refunds API');
+
+    const current = ticketscloudService.getCachedStats('aggregate-cache-secret', 'today');
+    assert.ok(current?.isFresh);
+    const stale = ticketscloudService.getCachedStats(
+      'aggregate-cache-secret', 'today', false, current!.verifiedAt + 121_000
+    );
+    assert.equal(stale?.isFresh, false);
+    assert.match(stale!.data.text, /Обновляю данные/);
+
+    failRefunds = true;
+    const fallback = await ticketscloudService.getStats('aggregate-cache-secret', 'today', true);
+    assert.match(fallback.text, /123,00 ₽/);
+    assert.match(fallback.text, /Не удалось обновить/);
+    assert.doesNotMatch(fallback.text, /Не удалось получить статистику/);
+    await ticketscloudService.getStats('aggregate-cache-secret', 'today', true);
+    assert.equal(refundRequests, 3, 'failed refresh must not extend cache freshness');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('uses a deterministic HMAC cache key without exposing the API key', () => {
+  const secret = 'ticketscloud-sensitive-api-key';
+  const from = new Date('2026-08-31T21:00:00.000Z');
+  const first = makeStatsCacheKey(secret, 'today', from);
+  const second = makeStatsCacheKey(secret, 'today', from);
+  assert.equal(first, second);
+  assert.equal(first.includes(secret), false);
+  assert.notEqual(first, makeStatsCacheKey(`${secret}-other`, 'today', from));
+  assert.notEqual(first, makeStatsCacheKey(secret, 'week', from));
 });
 
 test('does not call API without organizer key', async () => {

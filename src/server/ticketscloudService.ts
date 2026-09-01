@@ -1,3 +1,5 @@
+import { createHmac } from 'node:crypto';
+
 export type StatsPeriod = 'today' | 'week';
 
 type Money = string | number;
@@ -76,9 +78,15 @@ type RefundsResponse = {
 };
 
 type EventStats = { title: string; orders: number; tickets: number; sales: number };
-type BotStatsResponse = {
+export type BotStatsResponse = {
   text: string;
   reply_markup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+};
+
+export type CachedStatsSnapshot = {
+  data: BotStatsResponse;
+  isFresh: boolean;
+  verifiedAt: number;
 };
 
 const API_BASE_URL = (process.env.TICKETSCLOUD_API_BASE_URL || 'https://ticketscloud.com').replace(/\/$/, '');
@@ -86,13 +94,59 @@ const ORDERS_PATH = '/v2/resources/orders';
 const REFUNDS_PATH = '/v2/resources/refund_requests';
 const PAGE_SIZE = 200;
 const MAX_PAGES = 1_000;
-const CACHE_TTL_MS = 30_000;
+const CACHE_TODAY_TTL_MS = Math.max(30_000, Number(process.env.CACHE_TODAY_TTL_MS) || 120_000);
+const CACHE_WEEK_TTL_MS = Math.max(30_000, Number(process.env.CACHE_WEEK_TTL_MS) || 300_000);
+const CACHE_MAX_STALE_MS = Math.max(300_000, Number(process.env.CACHE_MAX_STALE_MS) || 1_800_000);
+const CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CACHE_MAX_ENTRIES) || 1_000);
+const CACHE_FORMULA_VERSION = 'orders-v4';
+const CACHE_KEY_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
 const API_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.TICKETSCLOUD_REQUEST_TIMEOUT_MS) || 45_000);
 const API_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.TICKETSCLOUD_MAX_ATTEMPTS) || 2));
 const REPORT_TIME_ZONE = process.env.REPORT_TIME_ZONE || 'Europe/Moscow';
 const ORDER_LOOKBACK_DAYS = Math.max(7, Number(process.env.ORDER_LOOKBACK_DAYS) || 90);
 const DAY_MS = 24 * 60 * 60 * 1_000;
-const cache = new Map<string, { data: BotStatsResponse; expiresAt: number }>();
+const cache = new Map<string, { data: BotStatsResponse; verifiedAt: number }>();
+
+function cacheTtl(period: StatsPeriod): number {
+  return period === 'today' ? CACHE_TODAY_TTL_MS : CACHE_WEEK_TTL_MS;
+}
+
+export function makeStatsCacheKey(apiKey: string, period: StatsPeriod, from: Date): string {
+  const fingerprint = createHmac('sha256', CACHE_KEY_SECRET).update(apiKey).digest('hex');
+  return `${CACHE_FORMULA_VERSION}:${REPORT_TIME_ZONE}:${fingerprint}:${period}:${from.toISOString()}`;
+}
+
+function verifiedTime(timestamp: number): string {
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: REPORT_TIME_ZONE,
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).format(new Date(timestamp));
+}
+
+function cachedResponse(
+  entry: { data: BotStatsResponse; verifiedAt: number },
+  state: 'fresh' | 'refreshing' | 'failed'
+): BotStatsResponse {
+  const time = verifiedTime(entry.verifiedAt);
+  const footer = state === 'fresh'
+    ? `✅ <i>Проверено: ${time} ${REPORT_TIME_ZONE}</i>`
+    : state === 'refreshing'
+      ? `⏳ <i>Обновляю данные… Показана проверенная версия от ${time} ${REPORT_TIME_ZONE}.</i>`
+      : `⚠️ <i>Не удалось обновить. Показана проверенная версия от ${time} ${REPORT_TIME_ZONE}.</i>`;
+  return { ...entry.data, text: `${entry.data.text}\n\n${footer}` };
+}
+
+function putCache(key: string, data: BotStatsResponse, verifiedAt: number): void {
+  for (const [existingKey, entry] of cache) {
+    if (verifiedAt - entry.verifiedAt > CACHE_MAX_STALE_MS) cache.delete(existingKey);
+  }
+  if (!cache.has(key) && cache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey) cache.delete(oldestKey);
+  }
+  cache.delete(key);
+  cache.set(key, { data, verifiedAt });
+}
 
 function wait(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -465,6 +519,27 @@ function periodTitle(period: StatsPeriod, from: Date, to: Date): string {
 }
 
 export const ticketscloudService = {
+  getCachedStats(
+    apiKey?: string,
+    period: StatsPeriod = 'today',
+    revalidating = false,
+    now = Date.now()
+  ): CachedStatsSnapshot | undefined {
+    const normalizedKey = apiKey?.trim();
+    if (!normalizedKey) return undefined;
+    const { from } = periodRange(period, new Date(now));
+    const entry = cache.get(makeStatsCacheKey(normalizedKey, period, from));
+    if (!entry) return undefined;
+    const age = Math.max(0, now - entry.verifiedAt);
+    if (age > CACHE_MAX_STALE_MS) return undefined;
+    const isFresh = age <= cacheTtl(period);
+    return {
+      data: cachedResponse(entry, revalidating || !isFresh ? 'refreshing' : 'fresh'),
+      isFresh,
+      verifiedAt: entry.verifiedAt
+    };
+  },
+
   async getStats(apiKey?: string, period: StatsPeriod = 'today', forceRefresh = false): Promise<BotStatsResponse> {
     const normalizedKey = apiKey?.trim();
     if (!normalizedKey) return {
@@ -473,9 +548,12 @@ export const ticketscloudService = {
     };
 
     const { from, to } = periodRange(period);
-    const cacheKey = `${normalizedKey}_${period}_${from.toISOString().slice(0, 13)}`;
-    const cached = cache.get(cacheKey);
-    if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.data, text: `${cached.data.text}\n\n<i>⚡ Данные из кэша (30 сек)</i>` };
+    const key = makeStatsCacheKey(normalizedKey, period, from);
+    const cached = cache.get(key);
+    const now = Date.now();
+    if (!forceRefresh && cached && now - cached.verifiedAt <= cacheTtl(period)) {
+      return cachedResponse(cached, 'fresh');
+    }
 
     let fetched: Awaited<ReturnType<typeof fetchOrders>>;
     let fetchedRefunds: Awaited<ReturnType<typeof fetchRefunds>>;
@@ -485,6 +563,9 @@ export const ticketscloudService = {
         fetchRefunds(normalizedKey, from, to)
       ]);
     } catch (error: any) {
+      if (cached && now - cached.verifiedAt <= CACHE_MAX_STALE_MS) {
+        return cachedResponse(cached, 'failed');
+      }
       return {
         text: `⚠️ <b>Не удалось получить статистику</b>\nAPI вернул: <code>${escapeHtml(error?.message || error)}</code>`,
         reply_markup: { inline_keyboard: [[{ text: '🔄 Повторить', callback_data: period === 'week' ? 'stats_week' : 'stats_today' }]] }
@@ -518,7 +599,8 @@ export const ticketscloudService = {
         [{ text: '🔄 Обновить', callback_data: period === 'week' ? 'refresh_stats_week' : 'refresh_stats_today' }]
       ] }
     };
-    cache.set(cacheKey, { data, expiresAt: Date.now() + CACHE_TTL_MS });
-    return data;
+    const verifiedAt = Date.now();
+    putCache(key, data, verifiedAt);
+    return cachedResponse({ data, verifiedAt }, 'fresh');
   }
 };
