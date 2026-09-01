@@ -129,6 +129,23 @@ function zonedMidnightUtc(date: Date, daysBack: number): Date {
   return new Date(localMidnightAsUtc.getTime() - timeZoneOffsetMs(localMidnightAsUtc));
 }
 
+export function parseApiDate(value?: string): Date | undefined {
+  if (!value) return undefined;
+  const local = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (local) {
+    // Orders API возвращает done_at без offset. Это локальное время отчёта,
+    // поэтому нельзя оставлять разбор часовому поясу процесса Railway.
+    const wallClockUtc = new Date(Date.UTC(
+      Number(local[1]), Number(local[2]) - 1, Number(local[3]),
+      Number(local[4]), Number(local[5]), Number(local[6] || 0)
+    ));
+    return new Date(wallClockUtc.getTime() - timeZoneOffsetMs(wallClockUtc));
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? undefined : date;
+}
+
 export function periodRange(period: StatsPeriod, now = new Date()): { from: Date; to: Date } {
   // Кабинет TicketsCloud для «Недели» показывает интервал от полуночи
   // семь суток назад до текущего момента (на экране видны обе граничные даты).
@@ -168,7 +185,9 @@ function eventIdentity(order: Order, refs: OrdersResponse['refs']): { key: strin
     || titleText(eventRef?.title) || eventRef?.name
     || (metaEventId ? `Мероприятие ${metaEventId}` : order.event ? `Мероприятие ${order.event}` : 'Мероприятие без названия');
   const venue = eventRef?.venue ? refs?.venues?.[eventRef.venue] : undefined;
-  const start = eventStart(eventRef?.lifetime?.start, eventRef?.timezone || venue?.city?.timezone);
+  // Часовой пояс города площадки надёжнее общего timezone события: start
+  // может приходить в UTC, а кабинет показывает локальное время площадки.
+  const start = eventStart(eventRef?.lifetime?.start, venue?.city?.timezone || eventRef?.timezone);
   const city = localizedName(venue?.city?.name);
   const details = [start, city].filter(Boolean).join(', ');
   return {
@@ -189,11 +208,10 @@ function orderSales(order: Order): number {
 }
 
 function isCompletedSale(order: Order): boolean {
-  // Аналитика TicketsCloud относит продажу к периоду только по done_at.
-  // Статус сам по себе недостаточен: API иногда возвращает `done` у заказа
-  // без даты завершения, и подстановка created_at завышает отчёт.
-  if (!order.done_at) return false;
-  return !Number.isNaN(new Date(order.done_at).valueOf());
+  // Кабинет считает только заказы, которые сейчас завершены. done_at может
+  // сохраниться у отменённого/откаченного заказа, поэтому одной даты мало.
+  if (order.status?.toLowerCase() !== 'done') return false;
+  return Boolean(parseApiDate(order.done_at));
 }
 
 function restoreRefundedTickets(
@@ -379,9 +397,8 @@ export const ticketscloudService = {
     }
 
     const selected = fetched.orders.filter(order => {
-      if (!order.done_at) return false;
-      const completedAt = new Date(order.done_at);
-      return !Number.isNaN(completedAt.valueOf()) && completedAt >= from && completedAt <= to;
+      const completedAt = parseApiDate(order.done_at);
+      return Boolean(completedAt && completedAt >= from && completedAt <= to);
     });
     const stats = aggregateOrders(selected, fetched.refs, fetchedRefunds.refunds, fetchedRefunds.ticketRefs);
     const eventLines = [...stats.events.entries()]

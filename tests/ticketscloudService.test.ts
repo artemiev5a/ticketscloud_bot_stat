@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregateOrders, periodRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
+import { aggregateOrders, parseApiDate, periodRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
 
 test('matches the dashboard week boundaries in Moscow time', () => {
   const range = periodRange('week', new Date('2026-08-27T07:27:00Z'));
   assert.equal(range.from.toISOString(), '2026-08-19T21:00:00.000Z');
   assert.equal(range.to.toISOString(), '2026-08-27T07:27:00.000Z');
+});
+
+test('parses timezone-less API completion dates as Moscow time', () => {
+  assert.equal(parseApiDate('2026-08-31 22:30:00')?.toISOString(), '2026-08-31T19:30:00.000Z');
+  assert.equal(parseApiDate('2026-09-01T00:30:00Z')?.toISOString(), '2026-09-01T00:30:00.000Z');
 });
 
 test('matches Matyukhina dashboard with discounts and restored refunded tickets', () => {
@@ -93,6 +98,24 @@ test('does not count an order without done_at even when its status is done', () 
   assert.equal(stats.ticketsSold, 0);
 });
 
+test('does not count an order that has done_at but is no longer done', () => {
+  const stats = aggregateOrders([{
+    id: 'rolled-back-order',
+    status: 'cancelled',
+    done_at: '2026-09-01T10:00:00Z',
+    event: 'event-1',
+    values: { nominal: 14_000 },
+    tickets: Array.from({ length: 5 }, (_, index) => ({
+      id: `rolled-back-ticket-${index}`,
+      nominal: index === 0 ? 14_000 : 0
+    }))
+  }]);
+
+  assert.equal(stats.sales, 0);
+  assert.equal(stats.successfulOrders, 0);
+  assert.equal(stats.ticketsSold, 0);
+});
+
 test('distinguishes sessions with the same title by date, time and city', () => {
   const orders = [
     { id: 'order-1', status: 'done', done_at: '2026-09-01T10:00:00Z', event: 'lumen-nsk', tickets: [{ nominal: 1_000 }] },
@@ -100,11 +123,11 @@ test('distinguishes sessions with the same title by date, time and city', () => 
   ];
   const refs = {
     events: {
-      'lumen-nsk': { title: { text: 'LUMEN' }, lifetime: { start: '2026-10-18 19:00:00' }, venue: 'venue-nsk' },
+      'lumen-nsk': { title: { text: 'LUMEN' }, lifetime: { start: '2026-10-18T12:00:00Z' }, timezone: 'UTC', venue: 'venue-nsk' },
       'lumen-kzn': { title: { text: 'LUMEN' }, lifetime: { start: '2026-11-09 20:00:00' }, venue: 'venue-kzn' }
     },
     venues: {
-      'venue-nsk': { city: { name: { ru: 'Новосибирск' } } },
+      'venue-nsk': { city: { name: { ru: 'Новосибирск' }, timezone: 'Asia/Novosibirsk' } },
       'venue-kzn': { city: { name: { ru: 'Казань' } } }
     }
   };
