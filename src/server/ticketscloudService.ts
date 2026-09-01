@@ -168,7 +168,9 @@ function eventIdentity(order: Order, refs: OrdersResponse['refs']): { key: strin
     || titleText(eventRef?.title) || eventRef?.name
     || (metaEventId ? `Мероприятие ${metaEventId}` : order.event ? `Мероприятие ${order.event}` : 'Мероприятие без названия');
   const venue = eventRef?.venue ? refs?.venues?.[eventRef.venue] : undefined;
-  const start = eventStart(eventRef?.lifetime?.start, eventRef?.timezone || venue?.city?.timezone);
+  // Часовой пояс города площадки надёжнее общего timezone события: start
+  // может приходить в UTC, а кабинет показывает локальное время площадки.
+  const start = eventStart(eventRef?.lifetime?.start, venue?.city?.timezone || eventRef?.timezone);
   const city = localizedName(venue?.city?.name);
   const details = [start, city].filter(Boolean).join(', ');
   return {
@@ -189,9 +191,9 @@ function orderSales(order: Order): number {
 }
 
 function isCompletedSale(order: Order): boolean {
-  // Аналитика TicketsCloud относит продажу к периоду только по done_at.
-  // Статус сам по себе недостаточен: API иногда возвращает `done` у заказа
-  // без даты завершения, и подстановка created_at завышает отчёт.
+  // Кабинет считает только заказы, которые сейчас завершены. done_at может
+  // сохраниться у отменённого/откаченного заказа, поэтому одной даты мало.
+  if (order.status?.toLowerCase() !== 'done') return false;
   if (!order.done_at) return false;
   return !Number.isNaN(new Date(order.done_at).valueOf());
 }
