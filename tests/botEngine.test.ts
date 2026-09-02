@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TelegramBotEngine } from '../src/server/botEngine.ts';
 
+process.env.ENCRYPTION_SECRET = 'test-only-encryption-secret-32-bytes-minimum';
+process.env.CACHE_KEY_SECRET = 'test-only-cache-secret-32-bytes-minimum';
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;

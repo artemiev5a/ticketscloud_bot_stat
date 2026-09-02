@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { aggregateOrders, makeStatsCacheKey, parseApiDate, periodRange, selectOrdersForRange, ticketscloudService } from '../src/server/ticketscloudService.ts';
 
+process.env.CACHE_KEY_SECRET = 'test-only-cache-secret-32-bytes-minimum';
+
 test('matches the dashboard week boundaries in Moscow time', () => {
   const range = periodRange('week', new Date('2026-08-27T07:27:00Z'));
   assert.equal(range.from.toISOString(), '2026-08-19T21:00:00.000Z');

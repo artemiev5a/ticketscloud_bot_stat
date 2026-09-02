@@ -4,8 +4,7 @@ import { ticketscloudService } from './ticketscloudService.ts';
 import type { StatsPeriod } from './ticketscloudService.ts';
 import { encryptApiKey, decryptApiKey } from './cryptoUtils.ts';
 import { createHmac } from 'node:crypto';
-
-const STATS_FLIGHT_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
+import { getCacheKeySecret } from './securityConfig.ts';
 
 export class TelegramBotEngine {
   private config: BotConfig = {
@@ -291,7 +290,7 @@ export class TelegramBotEngine {
   }
 
   private loadStats(apiKey: string, period: StatsPeriod, forceRefresh: boolean) {
-    const fingerprint = createHmac('sha256', STATS_FLIGHT_SECRET).update(apiKey).digest('hex');
+    const fingerprint = createHmac('sha256', getCacheKeySecret()).update(apiKey).digest('hex');
     // Fresh cache hits return before this method. Any call that reaches the
     // network (cache miss, stale or manual refresh) can safely share one load.
     const flightKey = `${fingerprint}:${period}`;
@@ -333,12 +332,20 @@ export class TelegramBotEngine {
     let realApiKey = '';
 
     if (encryptedKey) {
-      const decrypted = decryptApiKey(encryptedKey);
       try {
-        const parsed = JSON.parse(decrypted);
-        realApiKey = parsed.k;
-      } catch (e) {
-        realApiKey = decrypted; // Для обратной совместимости, если ключ сохраняли до этого обновления
+        const decrypted = decryptApiKey(encryptedKey);
+        try {
+          const parsed = JSON.parse(decrypted);
+          realApiKey = parsed.k;
+        } catch {
+          realApiKey = decrypted;
+        }
+      } catch {
+        await this.sendBotReply(
+          chatId,
+          '⚠️ <b>Не удалось прочитать сохранённый API-ключ.</b>\n\nПожалуйста, укажите его повторно командой <code>/setkey ВАШ_КЛЮЧ</code>.'
+        );
+        return;
       }
     }
 

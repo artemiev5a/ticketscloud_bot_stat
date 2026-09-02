@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import { getCacheKeySecret } from './securityConfig.ts';
 
 export type StatsPeriod = 'today' | 'week';
 
@@ -99,7 +100,6 @@ const CACHE_WEEK_TTL_MS = Math.max(30_000, Number(process.env.CACHE_WEEK_TTL_MS)
 const CACHE_MAX_STALE_MS = Math.max(300_000, Number(process.env.CACHE_MAX_STALE_MS) || 1_800_000);
 const CACHE_MAX_ENTRIES = Math.max(10, Number(process.env.CACHE_MAX_ENTRIES) || 1_000);
 const CACHE_FORMULA_VERSION = 'orders-v5-full-pagination';
-const CACHE_KEY_SECRET = process.env.CACHE_KEY_SECRET || process.env.ENCRYPTION_SECRET || 'ticketscloud-local-cache';
 const API_REQUEST_TIMEOUT_MS = Math.max(5_000, Number(process.env.TICKETSCLOUD_REQUEST_TIMEOUT_MS) || 45_000);
 // Длинный отчёт может состоять из десятков страниц. Ticketscloud иногда
 // отвечает 504 на одной из них, хотя повтор того же запроса проходит успешно.
@@ -115,7 +115,7 @@ function cacheTtl(period: StatsPeriod): number {
 }
 
 export function makeStatsCacheKey(apiKey: string, period: StatsPeriod, from: Date): string {
-  const fingerprint = createHmac('sha256', CACHE_KEY_SECRET).update(apiKey).digest('hex');
+  const fingerprint = createHmac('sha256', getCacheKeySecret()).update(apiKey).digest('hex');
   return `${CACHE_FORMULA_VERSION}:${REPORT_TIME_ZONE}:${fingerprint}:${period}:${from.toISOString()}`;
 }
 
