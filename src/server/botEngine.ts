@@ -179,6 +179,10 @@ export class TelegramBotEngine {
 
     // 1. Ожидание ввода API-ключа
     if (this.awaitingKeyUsers.has(user.id) && !text.startsWith('/')) {
+      if (msg.chat?.type && msg.chat.type !== 'private') {
+        await this.sendBotReply(chatId, '⚠️ API-ключ можно отправить только в личном чате с ботом.');
+        return;
+      }
       this.saveApiKey(text, user.id);
       this.awaitingKeyUsers.delete(user.id);
       
@@ -191,6 +195,10 @@ export class TelegramBotEngine {
 
     // 2. Команда /setkey
     if (text.startsWith('/setkey')) {
+      if (msg.chat?.type && msg.chat.type !== 'private') {
+        await this.sendBotReply(chatId, '⚠️ API-ключ можно отправить только в личном чате с ботом.');
+        return;
+      }
       const input = text.replace('/setkey', '').trim();
       if (!input) {
         await this.sendBotReply(chatId, '✏️ <b>Укажите API-ключ после команды:</b>\n\n<code>/setkey ВАШ_КЛЮЧ</code>');

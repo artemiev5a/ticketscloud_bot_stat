@@ -1,0 +1,191 @@
+name: Deploy to Ticketscloud server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ticketscloud-production
+  cancel-in-progress: false
+
+jobs:
+  verify-and-deploy:
+    name: Verify and deploy
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.19.0 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify application
+        run: |
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+
+          : "${DEPLOY_HOST:?Set the DEPLOY_HOST GitHub variable}"
+          : "${DEPLOY_USER:?Set the DEPLOY_USER GitHub variable}"
+          : "${DEPLOY_PATH:?Set the DEPLOY_PATH GitHub variable}"
+          : "${DEPLOY_SSH_PRIVATE_KEY:?Set the DEPLOY_SSH_PRIVATE_KEY GitHub secret}"
+          : "${DEPLOY_KNOWN_HOSTS:?Set the DEPLOY_KNOWN_HOSTS GitHub secret}"
+
+          DEPLOY_PORT="${DEPLOY_PORT:-22}"
+
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || { echo "Invalid DEPLOY_HOST"; exit 1; }
+          [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]] || { echo "Invalid DEPLOY_PORT"; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid DEPLOY_USER"; exit 1; }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "Invalid DEPLOY_PATH"; exit 1; }
+          [[ "$DEPLOY_PATH" != "/" && "$DEPLOY_PATH" != *"/../"* ]] || { echo "Unsafe DEPLOY_PATH"; exit 1; }
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+          {
+            echo "DEPLOY_PORT=$DEPLOY_PORT"
+            echo "DEPLOY_TARGET=$DEPLOY_USER@$DEPLOY_HOST"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare release directory
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -Eeuo pipefail
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_TARGET" \
+            "mkdir -p '$DEPLOY_PATH/releases/$GITHUB_SHA' '$DEPLOY_PATH/shared' && test -f '$DEPLOY_PATH/shared/.env'"
+
+      - name: Upload release
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -Eeuo pipefail
+          rsync -az \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='node_modules/' \
+            --exclude='.pnpm-store/' \
+            --exclude='dist/' \
+            -e "ssh -i $HOME/.ssh/deploy_key -p $DEPLOY_PORT -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+            ./ "$DEPLOY_TARGET:$DEPLOY_PATH/releases/$GITHUB_SHA/"
+
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_TARGET" \
+            "ln -sfn '$DEPLOY_PATH/shared/.env' '$DEPLOY_PATH/releases/$GITHUB_SHA/.env'"
+
+      - name: Start release and verify health
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          set -Eeuo pipefail
+
+          ssh \
+            -i "$HOME/.ssh/deploy_key" \
+            -p "$DEPLOY_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEPLOY_TARGET" \
+            "bash -s -- '$DEPLOY_PATH' '$GITHUB_SHA'" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          deploy_path="$1"
+          release_sha="$2"
+          release_path="$deploy_path/releases/$release_sha"
+          new_image="ticketscloud-stat-bot:$release_sha"
+
+          cd "$release_path"
+          docker compose config --quiet
+
+          old_container="$(docker compose ps -q app 2>/dev/null || true)"
+          old_image=""
+          if [ -n "$old_container" ]; then
+            old_image="$(docker inspect --format '{{.Config.Image}}' "$old_container" 2>/dev/null || true)"
+          fi
+
+          APP_IMAGE="$new_image" docker compose build --pull app
+
+          rollback() {
+            echo "New release failed. Restoring the previous container."
+            APP_IMAGE="$new_image" docker compose logs --tail=150 app || true
+
+            if [ -n "$old_image" ] && docker image inspect "$old_image" >/dev/null 2>&1; then
+              APP_IMAGE="$old_image" docker compose up -d --no-build --remove-orphans app
+            else
+              APP_IMAGE="$new_image" docker compose down || true
+            fi
+          }
+
+          if ! APP_IMAGE="$new_image" docker compose up -d --no-build --remove-orphans app; then
+            rollback
+            exit 1
+          fi
+
+          healthy=false
+          for _ in $(seq 1 40); do
+            container_id="$(APP_IMAGE="$new_image" docker compose ps -q app 2>/dev/null || true)"
+            if [ -n "$container_id" ]; then
+              health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+              if [ "$health" = "healthy" ]; then
+                healthy=true
+                break
+              fi
+              if [ "$health" = "unhealthy" ] || [ "$health" = "exited" ] || [ "$health" = "dead" ]; then
+                break
+              fi
+            fi
+            sleep 3
+          done
+
+          if [ "$healthy" != "true" ]; then
+            rollback
+            exit 1
+          fi
+
+          ln -sfn "$release_path" "$deploy_path/current"
+          APP_IMAGE="$new_image" docker compose ps
+          REMOTE_SCRIPT
