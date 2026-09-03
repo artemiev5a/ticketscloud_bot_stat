@@ -15,8 +15,7 @@ FROM base AS build
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
-RUN --mount=type=cache,target=/pnpm/store \
-    pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
@@ -30,8 +29,7 @@ FROM base AS production-dependencies
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
-RUN --mount=type=cache,target=/pnpm/store \
-    pnpm install --prod --frozen-lockfile
+RUN pnpm install --prod --frozen-lockfile
 
 
 FROM node:22.20-bookworm-slim AS runtime
