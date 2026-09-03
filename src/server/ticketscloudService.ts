@@ -35,6 +35,7 @@ type Order = {
 type OrdersResponse = {
   data?: Order[];
   pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
+  total_count?: number;
   refs?: {
     events?: Record<string, {
       title?: LocalizedTitle;
@@ -70,6 +71,7 @@ type RefundRequest = {
 type RefundsResponse = {
   data?: RefundRequest[];
   pagination?: { page?: number; page_size?: number; total?: number; pages?: number };
+  total_count?: number;
   refs?: {
     tickets?: Record<string, Ticket>;
   };
@@ -95,6 +97,9 @@ const ORDERS_PATH = '/v2/resources/orders';
 const REFUNDS_PATH = '/v2/resources/refund_requests';
 const PAGE_SIZE = 200;
 const MAX_PAGES = 1_000;
+// Страницы загружаются небольшими параллельными окнами. Верхняя граница
+// защищает Ticketscloud API от слишком агрессивной конфигурации.
+const PAGE_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.TICKETSCLOUD_PAGE_CONCURRENCY) || 4));
 const CACHE_TODAY_TTL_MS = Math.max(30_000, Number(process.env.CACHE_TODAY_TTL_MS) || 120_000);
 const CACHE_WEEK_TTL_MS = Math.max(30_000, Number(process.env.CACHE_WEEK_TTL_MS) || 300_000);
 const CACHE_MAX_STALE_MS = Math.max(300_000, Number(process.env.CACHE_MAX_STALE_MS) || 1_800_000);
@@ -416,45 +421,110 @@ export function aggregateOrders(
   };
 }
 
+type PagedRequest<TBody, TItem> = {
+  apiKey: string;
+  path: string;
+  resource: 'Orders' | 'Refunds';
+  baseQuery: Record<string, string>;
+  rows: (body: TBody) => TItem[] | undefined;
+  identity: (item: TItem) => string;
+  collect?: (body: TBody) => void;
+};
+
+/**
+ * Оценивает число страниц по первой странице. `total_count` используется
+ * только для планирования размера окна; концом выборки остаётся пустая
+ * страница, поэтому отсутствующая или заниженная оценка не обрезает отчёт.
+ */
+function estimatePages(totalCount: unknown, rowsOnFirstPage: number): number | undefined {
+  const total = typeof totalCount === 'number' ? totalCount : Number(totalCount);
+  if (!Number.isFinite(total) || total <= 0 || rowsOnFirstPage <= 0) return undefined;
+  return Math.ceil(total / rowsOnFirstPage);
+}
+
+async function fetchAllPages<TBody, TItem>(request: PagedRequest<TBody, TItem>): Promise<TItem[]> {
+  const { apiKey, path, resource, baseQuery, rows, identity, collect } = request;
+  const items: TItem[] = [];
+  const seen = new Set<string>();
+  let nextPage = 1;
+  let windowSize = 1;
+  let plannedPages: number | undefined;
+
+  const load = (page: number) => {
+    const query = new URLSearchParams({ ...baseQuery, page_size: String(PAGE_SIZE), page: String(page) });
+    return fetchApiPage<TBody>(apiKey, path, query, resource, page).then(body => ({ page, body }));
+  };
+
+  while (true) {
+    if (nextPage > MAX_PAGES) throw new Error(`Превышен лимит страниц (${resource})`);
+    const pages: number[] = [];
+    for (let offset = 0; offset < windowSize && nextPage + offset <= MAX_PAGES; offset += 1) {
+      pages.push(nextPage + offset);
+    }
+
+    const responses = await Promise.all(pages.map(load));
+    // Порядок завершения параллельных запросов не должен влиять на результат.
+    responses.sort((left, right) => left.page - right.page);
+
+    let reachedEnd = false;
+    for (const { page, body } of responses) {
+      const data = rows(body);
+      if (!Array.isArray(data)) throw new Error(`${resource} API вернул ответ неизвестного формата`);
+      collect?.(body);
+
+      if (data.length === 0) {
+        reachedEnd = true;
+        break;
+      }
+
+      let addedOnPage = 0;
+      for (const item of data) {
+        const key = identity(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push(item);
+        addedOnPage += 1;
+      }
+      if (addedOnPage === 0) {
+        throw new Error(`${resource} API повторил страницу ${page}; полный отчёт не сформирован`);
+      }
+
+      if (page === 1) {
+        plannedPages = estimatePages((body as { total_count?: number }).total_count, data.length);
+      }
+    }
+    if (reachedEnd) break;
+
+    nextPage += pages.length;
+    if (plannedPages !== undefined) {
+      const remaining = plannedPages - nextPage + 1;
+      windowSize = Math.max(1, Math.min(PAGE_CONCURRENCY, remaining));
+    } else {
+      windowSize = Math.min(PAGE_CONCURRENCY, windowSize * 2);
+    }
+  }
+
+  return items;
+}
+
 async function fetchOrders(apiKey: string, from: Date, to: Date): Promise<{ orders: Order[]; refs: NonNullable<OrdersResponse['refs']> }> {
-  const orders: Order[] = [];
   const refs: NonNullable<OrdersResponse['refs']> = { events: {}, meta_events: {}, venues: {} };
   const queryFrom = new Date(from.getTime() - ORDER_LOOKBACK_DAYS * DAY_MS);
-  const seenOrders = new Set<string>();
-  let page = 1;
 
-  while (page <= MAX_PAGES) {
-    const query = new URLSearchParams({
-      created_at: `${queryFrom.toISOString()},${to.toISOString()}`,
-      page_size: String(PAGE_SIZE),
-      page: String(page)
-    });
-    const body = await fetchApiPage<OrdersResponse>(apiKey, ORDERS_PATH, query, 'Orders', page);
-    if (!Array.isArray(body.data)) throw new Error('Orders API вернул ответ неизвестного формата');
-    // pagination.total в живом API может означать размер текущего фрагмента,
-    // поэтому завершение доказывает только реально пустая следующая страница.
-
-    const rows = body.data;
-    Object.assign(refs.events!, body.refs?.events || {});
-    Object.assign(refs.meta_events!, body.refs?.meta_events || {});
-    Object.assign(refs.venues!, body.refs?.venues || {});
-
-    let addedOnPage = 0;
-    for (const order of rows) {
-      // Не полагаемся на неодинаковые варианты `pagination` в Orders API:
-      // запрашиваем следующую страницу до пустого ответа. Защита от повторов
-      // останавливает цикл, даже если API проигнорирует параметр `page`.
-      const identity = order.id || JSON.stringify(order);
-      if (seenOrders.has(identity)) continue;
-      seenOrders.add(identity);
-      orders.push(order);
-      addedOnPage += 1;
+  const orders = await fetchAllPages<OrdersResponse, Order>({
+    apiKey,
+    path: ORDERS_PATH,
+    resource: 'Orders',
+    baseQuery: { created_at: `${queryFrom.toISOString()},${to.toISOString()}` },
+    rows: body => body.data,
+    identity: order => order.id || JSON.stringify(order),
+    collect: body => {
+      Object.assign(refs.events!, body.refs?.events || {});
+      Object.assign(refs.meta_events!, body.refs?.meta_events || {});
+      Object.assign(refs.venues!, body.refs?.venues || {});
     }
-    if (rows.length === 0) break;
-    if (addedOnPage === 0) throw new Error(`Orders API повторил страницу ${page}; полный отчёт не сформирован`);
-    page += 1;
-  }
-  if (page > MAX_PAGES) throw new Error('Превышен лимит страниц заказов');
+  });
+
   return { orders, refs };
 }
 
@@ -462,36 +532,23 @@ async function fetchRefunds(apiKey: string, from: Date, to: Date): Promise<{
   refunds: RefundRequest[];
   ticketRefs: Record<string, Ticket>;
 }> {
-  const refunds: RefundRequest[] = [];
   const ticketRefs: Record<string, Ticket> = {};
-  const seen = new Set<string>();
-  let page = 1;
 
-  while (page <= MAX_PAGES) {
-    const query = new URLSearchParams({
+  const refunds = await fetchAllPages<RefundsResponse, RefundRequest>({
+    apiKey,
+    path: REFUNDS_PATH,
+    resource: 'Refunds',
+    baseQuery: {
       finished_at: `${from.toISOString()},${to.toISOString()}`,
-      status: 'approved',
-      page_size: String(PAGE_SIZE),
-      page: String(page)
-    });
-    const body = await fetchApiPage<RefundsResponse>(apiKey, REFUNDS_PATH, query, 'Refunds', page);
-    if (!Array.isArray(body.data)) throw new Error('Refunds API вернул ответ неизвестного формата');
-
-    const rows = body.data;
-    Object.assign(ticketRefs, body.refs?.tickets || {});
-    let addedOnPage = 0;
-    for (const refund of rows) {
-      const identity = refund.id || JSON.stringify(refund);
-      if (seen.has(identity)) continue;
-      seen.add(identity);
-      refunds.push(refund);
-      addedOnPage += 1;
+      status: 'approved'
+    },
+    rows: body => body.data,
+    identity: refund => refund.id || JSON.stringify(refund),
+    collect: body => {
+      Object.assign(ticketRefs, body.refs?.tickets || {});
     }
-    if (rows.length === 0) break;
-    if (addedOnPage === 0) throw new Error(`Refunds API повторил страницу ${page}; полный отчёт не сформирован`);
-    page += 1;
-  }
-  if (page > MAX_PAGES) throw new Error('Превышен лимит страниц возвратов');
+  });
+
   return { refunds, ticketRefs };
 }
 

@@ -365,6 +365,8 @@ test('does not stop on an unreliable page-local pagination total', async () => {
 test('loads all 668 live-style orders without the broken server-side status filter', async () => {
   const originalFetch = globalThis.fetch;
   const orderPages: number[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
   const now = new Date(Date.now() - 60_000).toISOString();
   const orders = Array.from({ length: 668 }, (_, index) => ({
     id: `large-order-${index}`,
@@ -389,6 +391,8 @@ test('loads all 668 live-style orders without the broken server-side status filt
 
     const page = Number(url.searchParams.get('page'));
     orderPages.push(page);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
     // Воспроизводит живой дефект Ticketscloud: status=done ошибочно
     // ограничивал результат одной страницей и total=200.
     const hasBrokenFilter = url.searchParams.has('status');
@@ -397,15 +401,24 @@ test('loads all 668 live-style orders without the broken server-side status filt
       // Живой API запросил 200, но фактически отдавал короткие фрагменты
       // и на каждой странице сообщал page-local total=64.
       : orders.slice((page - 1) * 64, page * 64);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    inFlight -= 1;
     return new Response(JSON.stringify({
       data: rows,
-      pagination: { total: hasBrokenFilter ? 200 : 64 }
+      pagination: { total: hasBrokenFilter ? 200 : 64 },
+      total_count: orders.length
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
 
   try {
     const result = await ticketscloudService.getStats('live-668-key', 'today', true);
-    assert.deepEqual(orderPages, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert.deepEqual(
+      [...new Set(orderPages)].sort((left, right) => left - right),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    );
+    assert.equal(orderPages.length, 12, 'total_count должен исключить лишние запросы');
+    assert.ok(maxInFlight > 1, `страницы должны загружаться параллельно, было ${maxInFlight}`);
+    assert.ok(maxInFlight <= 4, `окно не должно превышать лимит, было ${maxInFlight}`);
     assert.match(result.text, /66\s800,00 ₽/);
     assert.match(result.text, /Успешных заказов: <b>668<\/b>/);
     assert.match(result.text, /Билетов: <b>668<\/b>/);
@@ -448,12 +461,12 @@ test('serves only aggregate cache with timestamp and falls back after refresh fa
     const first = await ticketscloudService.getStats('aggregate-cache-secret', 'today', true);
     assert.match(first.text, /123,00 ₽/);
     assert.match(first.text, /Проверено:/);
-    assert.equal(orderRequests, 2);
+    assert.equal(orderRequests, 3);
     assert.equal(refundRequests, 1);
 
     const second = await ticketscloudService.getStats('aggregate-cache-secret', 'today');
     assert.match(second.text, /123,00 ₽/);
-    assert.equal(orderRequests, 2, 'fresh aggregate cache must avoid Orders API');
+    assert.equal(orderRequests, 3, 'fresh aggregate cache must avoid Orders API');
     assert.equal(refundRequests, 1, 'fresh aggregate cache must avoid Refunds API');
 
     const current = ticketscloudService.getCachedStats('aggregate-cache-secret', 'today');
@@ -490,4 +503,84 @@ test('uses a deterministic HMAC cache key without exposing the API key', () => {
 test('does not call API without organizer key', async () => {
   const result = await ticketscloudService.getStats('');
   assert.match(result.text, /API-ключ не указан/);
+});
+
+test('keeps loading until an empty page when total_count understates the selection', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedPages: number[] = [];
+  const now = new Date(Date.now() - 60_000).toISOString();
+  const orders = Array.from({ length: 500 }, (_, index) => ({
+    id: `understated-order-${index}`,
+    status: 'done',
+    done_at: now,
+    values: { nominal: 10 },
+    tickets: [{ id: `understated-ticket-${index}`, nominal: 10 }]
+  }));
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [], refs: { tickets: {} } }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    const page = Number(url.searchParams.get('page'));
+    requestedPages.push(page);
+    return new Response(JSON.stringify({
+      data: orders.slice((page - 1) * 50, page * 50),
+      total_count: 100
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('understated-total-key', 'today', true);
+    assert.match(result.text, /Успешных заказов: <b>500<\/b>/);
+    assert.match(result.text, /Билетов: <b>500<\/b>/);
+    assert.ok(requestedPages.includes(11), 'обход должен дойти до пустой страницы');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('grows the page window when the API reports no total_count', async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedPages: number[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const now = new Date(Date.now() - 60_000).toISOString();
+  const orders = Array.from({ length: 300 }, (_, index) => ({
+    id: `no-total-order-${index}`,
+    status: 'done',
+    done_at: now,
+    values: { nominal: 1 },
+    tickets: []
+  }));
+
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(input.toString());
+    if (url.pathname === '/v2/resources/refund_requests') {
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    const page = Number(url.searchParams.get('page'));
+    requestedPages.push(page);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    inFlight -= 1;
+    return new Response(JSON.stringify({ data: orders.slice((page - 1) * 50, page * 50) }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  }) as typeof fetch;
+
+  try {
+    const result = await ticketscloudService.getStats('no-total-count-key', 'today', true);
+    assert.match(result.text, /Успешных заказов: <b>300<\/b>/);
+    assert.ok(maxInFlight > 1, `ожидалась параллельная загрузка, было ${maxInFlight}`);
+    assert.equal(requestedPages[0], 1, 'первая страница должна загружаться отдельно');
+    assert.ok(requestedPages.includes(7), 'конец выборки должен подтверждаться пустой страницей');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
